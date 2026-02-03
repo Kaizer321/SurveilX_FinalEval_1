@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login - Admin | SurveilX</title>
+  <style>
+    :root {
+      --bg: #0a0e1a;
+      --panel: #111d35;
+      --border: #1e2d4a;
+      --text: #e8eef7;
+      --muted: #a8b5cc;
+      --accent: #00d9ff;
+      --accent-bg: rgba(0, 217, 255, 0.08);
+    }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+
+    .box {
+      width: 100%;
+      max-width: 380px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 20px;
+    }
+
+    .muted {
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .input {
+      background: #0f1428;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+    }
+
+    .btn {
+      width: 100%;
+      background: var(--accent);
+      color: #001017;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 10px;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="box">
+    <h1>SurveilX</h1>
+    <div class="muted">Admin Login</div>
+    <form id="login-form">
+      <div class="field">
+        <label>Admin ID</label>
+        <input class="input" type="text" id="username" autocomplete="username" required />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <div style="position:relative">
+          <input class="input" type="password" id="password" autocomplete="current-password" required
+            style="width:100%; padding-right:40px; box-sizing:border-box;" />
+          <button type="button" id="toggle-pw"
+            style="position:absolute; right:4px; top:4px; bottom:4px; background:none; border:none; cursor:pointer; font-size:16px; color:var(--text);"
+            title="Show/Hide Password">👁️</button>
+        </div>
+      </div>
+      <script>
+        document.getElementById('toggle-pw').addEventListener('click', () => {
+          const inp = document.getElementById('password');
+          const btn = document.getElementById('toggle-pw');
+          if (inp.type === 'password') {
+            inp.type = 'text';
+            btn.textContent = '🔒';
+          } else {
+            inp.type = 'password';
+            btn.textContent = '👁️';
+          }
+        });
+      </script>
+      <button class="btn" type="submit">Login as Admin</button>
+    </form>
+    <div class="row">
+      <span class="muted">Regular user?</span>
+      <a href="login-user.html">User Login</a>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById('login-form');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      try {
+        const res = await fetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password, role: 'admin' })
+        });
+        if (!res.ok) throw new Error('Invalid credentials');
+        const data = await res.json();
+        localStorage.setItem('authToken', data.token);
+        localStorage.setItem('authRole', data.role);
+        location.href = 'index.html';
+      } catch (err) {
+        alert(err.message || 'Login failed');
+      }
+    });
+  </script>
+</body>
+
+</html>
