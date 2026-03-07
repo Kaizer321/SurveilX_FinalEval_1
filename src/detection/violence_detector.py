@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import collections
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
 from ultralytics import YOLO
+
+logger = logging.getLogger(__name__)
 
 
 class TemporalConvNet(nn.Module):
@@ -29,7 +33,7 @@ class TemporalConvNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.unsqueeze(2)  # (B, C, 1)
+        # x is expected to be (B, C, T) — temporal dimension already provided
         x = self.tcn(x)
         x = self.pool(x).squeeze(2)
         return x
@@ -45,9 +49,15 @@ class CNN_TCN_Fusion(nn.Module):
         cnn_out_size = 960
         self.tcn = TemporalConvNet(temporal_input_size)
         self.fc = nn.Sequential(
-            nn.Linear(cnn_out_size + 256, 128),
+            nn.Linear(cnn_out_size + 256, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(128, num_classes),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, frame: torch.Tensor, temporal: torch.Tensor) -> torch.Tensor:
@@ -66,6 +76,8 @@ class ViolenceDetector:
     CLASSES = ["Normal", "Pre-Violence", "Burglary", "Fighting", "Shooting", "Stealing"]
     MAX_PEOPLE = 5
     FEATURE_PER_PERSON = 10 + 4 + 17 * 2
+    TEMPORAL_BUFFER_SIZE = 16
+    EMA_ALPHA = 0.6
 
     def __init__(
         self,
@@ -79,6 +91,9 @@ class ViolenceDetector:
         self.feature_size = self.FEATURE_PER_PERSON * self.MAX_PEOPLE
         self._state: Dict[str, Dict[str, Any]] = {}
         self._to_tensor = transforms.ToTensor()
+        self._normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
 
         self.model = self._load_cnn_tcn()
         # Optimize for fixed input sizes
@@ -98,11 +113,15 @@ class ViolenceDetector:
             raise FileNotFoundError(f"Detector checkpoint not found: {self.checkpoint_path}")
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         # Handle both checkpoint formats: direct state_dict or wrapped in dictionary
-        if isinstance(checkpoint, dict) and "model_state" in checkpoint:
-            model.load_state_dict(checkpoint["model_state"])
-        else:
-            # Checkpoint is directly the state_dict
-            model.load_state_dict(checkpoint)
+        state_dict = checkpoint["model_state"] if isinstance(checkpoint, dict) and "model_state" in checkpoint else checkpoint
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            logger.warning(
+                "Checkpoint shape mismatch — loading with strict=False. "
+                "Retraining is recommended to benefit from the updated architecture."
+            )
+            model.load_state_dict(state_dict, strict=False)
         model.eval()
         return model
 
@@ -124,6 +143,8 @@ class ViolenceDetector:
                 "consecutive_count": 0,
                 "alert_consecutive_count": 0,
                 "alert_active": False,
+                "temporal_buffer": collections.deque(maxlen=self.TEMPORAL_BUFFER_SIZE),
+                "smooth_kp": None,
             }
         return self._state[cam_id]
 
@@ -217,7 +238,7 @@ class ViolenceDetector:
             frame_resized, top, bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
         )
         frame_rgb = cv2.cvtColor(frame_padded, cv2.COLOR_BGR2RGB)
-        tensor = self._to_tensor(frame_rgb).unsqueeze(0).to(self.device)
+        tensor = self._normalize(self._to_tensor(frame_rgb)).unsqueeze(0).to(self.device)
         return tensor, frame_padded, scale, top
 
     def _draw_keypoints(
@@ -295,10 +316,25 @@ class ViolenceDetector:
             feat, prev_kp, kp_norm = self._process_keypoints(res, state["prev_kp"])
             state["prev_kp"] = prev_kp
 
-            temporal_input = np.concatenate([feat, kp_norm.flatten()])
+            # Apply EMA smoothing to reduce keypoint noise
+            alpha = self.EMA_ALPHA
+            if state["smooth_kp"] is not None:
+                smooth_kp = alpha * kp_norm + (1 - alpha) * state["smooth_kp"]
+            else:
+                smooth_kp = kp_norm.copy()
+            state["smooth_kp"] = smooth_kp
+
+            # Build temporal input and accumulate into sliding window buffer
+            temporal_input = np.concatenate([feat, smooth_kp.flatten()])
+            state["temporal_buffer"].append(temporal_input)
+            buffer = np.array(list(state["temporal_buffer"]))  # (T, C)
+            if len(buffer) < self.TEMPORAL_BUFFER_SIZE:
+                pad = np.zeros((self.TEMPORAL_BUFFER_SIZE - len(buffer), buffer.shape[1]), dtype=np.float32)
+                buffer = np.vstack([pad, buffer])
             temporal_tensor = torch.tensor(
-                temporal_input, dtype=torch.float32, device=self.device
+                buffer.T, dtype=torch.float32, device=self.device
             ).unsqueeze(0)
+            # Shape: (1, C, T)
 
             outputs = self.model(frame_tensor, temporal_tensor)
             probs = F.softmax(outputs, dim=1)
@@ -306,14 +342,6 @@ class ViolenceDetector:
             pred_conf = float(max_prob.item())
             pred_idx = int(pred_idx_tensor.item())
             all_probs = probs[0].detach().cpu().numpy()
-
-        # --- Boost "Pre-Violence" (index 1) ---
-        # If Pre-Violence has decent probability, boost it to overcome suppression
-        if len(all_probs) > 1:
-            pre_violence_conf = all_probs[1]
-            if pre_violence_conf > 0.35:
-                # Boost by 40% if it's already somewhat detected
-                all_probs[1] = min(1.0, pre_violence_conf * 1.4)
 
         locked_class_idx = state["locked_class_idx"]
         candidate_class_idx = state["candidate_class_idx"]
@@ -460,7 +488,6 @@ class ViolenceDetector:
             "raw_probs": all_probs,
             "overlay_frame": overlay,
             "predicted_index": pred_idx,
-            "predicted_conf": pred_conf,
             "predicted_conf": pred_conf,
             "is_alert": is_alert,
             "keypoints": raw_keypoints
