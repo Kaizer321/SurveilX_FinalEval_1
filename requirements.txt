@@ -2,7 +2,6 @@
 opencv-python>=4.8.1.78
 numpy==1.26.4
 pandas>=2.2.1
-pytube>=15.0.0
 yt-dlp>=2024.10.22
 
 # Web framework
@@ -16,26 +15,18 @@ psycopg2-binary>=2.9.9
 sqlalchemy-utils>=0.42.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
+chromadb>=0.5.0
+cloudinary>=1.36.0
 
 # AI/ML
 torch>=2.1.2
 transformers>=4.38.2
 torchvision>=0.16.1
-ultralytics>=8.1.0
 
-# Vector database (pin to Pydantic v1-compatible)
-chromadb==0.4.22
+
 
 # Image processing
 pillow>=10.2.0
-
-# Required by chromadb
-pydantic>=1.9.0,<2.0.0
-sentence-transformers>=2.2.2
-sentencepiece
-
-# Development
-typing-extensions>=4.0.0
 
 # Auth
 passlib[bcrypt]>=1.7.4

@@ -13,7 +13,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
   <!-- Stylesheet -->
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="css/style.css?v=3">
 </head>
 
 <body>
@@ -23,27 +23,30 @@
     <aside class="sidebar">
       <div class="sidebar-header">
         <div class="logo">S</div>
-        <h1>SurveilX</h1>
+        <h1 class="sidebar-title">SurveilX</h1>
+        <button id="sidebar-toggle-btn" class="sidebar-toggle-btn">
+          <span class="icon">☰</span>
+        </button>
       </div>
 
       <nav class="nav">
         <a href="#dashboard" class="active" id="nav-dashboard">
-          <span class="icon">📊</span> Dashboard
+          <span class="icon">📊</span> <span class="label">Dashboard</span>
         </a>
         <a href="#cameras" id="nav-cameras">
-          <span class="icon">📹</span> Cameras
+          <span class="icon">📹</span> <span class="label">Cameras</span>
         </a>
         <a href="#events" id="nav-events">
-          <span class="icon">🔔</span> Events
+          <span class="icon">🔔</span> <span class="label">Events</span>
         </a>
         <a href="#search" id="nav-search">
-          <span class="icon">🔍</span> Search
+          <span class="icon">🔍</span> <span class="label">Search</span>
         </a>
-        <a href="#logs" id="nav-logs" class="admin-only">
-          <span class="icon">📜</span> Logs
+        <a href="#clips" id="nav-clips">
+          <span class="icon">🎬</span> <span class="label">Video Clips</span>
         </a>
         <a href="#settings" id="nav-settings" class="admin-only">
-          <span class="icon">⚙️</span> Settings
+          <span class="icon">⚙️</span> <span class="label">Settings</span>
         </a>
       </nav>
 
@@ -55,8 +58,8 @@
             <div class="role" id="user-role-badge">Administrator</div>
           </div>
         </div>
-        <button id="logout-btn" class="btn" style="width:100%; margin-top:12px;">
-          🚪 Logout
+        <button id="logout-btn" class="btn logout-btn" style="width:100%; margin-top:12px;">
+          <span class="icon">🚪</span> <span class="label">Logout</span>
         </button>
       </div>
     </aside>
@@ -70,7 +73,7 @@
           <span class="cam-count" id="cam-count">0 camera(s)</span>
           <select id="camera-select" class="select" style="width:180px;"></select>
           <button id="view-toggle" class="btn">Grid View</button>
-          <button id="toggle-kp" class="btn" title="Toggle Keypoints">🧍 Keypoints: off</button>
+          <button id="overlay-toggle" class="btn">📉 Overlay</button>
         </div>
         <div class="toolbar-right">
           <span class="muted" id="embed-count">Embeddings: 0</span>
@@ -81,8 +84,8 @@
       <!-- Detection Status Chips -->
       <div id="cam-tabs" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:20px;"></div>
 
-      <!-- ===== Admin Stats Grid ===== -->
-      <section id="admin-stats" class="admin-only stats-grid">
+      <!-- ===== Dashboard Stats Grid (Unlocked) ===== -->
+      <section id="admin-stats" class="stats-grid">
         <div class="card stat-card">
           <div class="value" id="stat-total-cameras">—</div>
           <div class="label">Total Cameras</div>
@@ -100,10 +103,6 @@
           <div class="label">Active Users</div>
         </div>
         <div class="card stat-card">
-          <div class="value" id="stat-storage">—</div>
-          <div class="label">Storage</div>
-        </div>
-        <div class="card stat-card">
           <div class="value" id="stat-critical">0</div>
           <div class="label">Critical Alerts</div>
         </div>
@@ -117,17 +116,19 @@
         <div id="thumbbar" class="hidden"></div>
       </section>
 
-      <!-- ===== Image Search ===== -->
+      <!-- ===== Visual Prompting & Search ===== -->
       <section id="search" class="card" style="margin-top:24px;">
-        <h3>🔍 Search by Image</h3>
+        <h3>🔍 Visual Prompting & Search</h3>
         <div class="card-body" style="display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
-          <label class="btn" style="cursor:pointer;">
+          <label class="btn" style="cursor:pointer;" title="Search by Image">
             <input id="upload-file" type="file" accept="image/*" style="display:none;">
-            📁 <span id="upload-name">Choose image</span>
+            📁 <span id="upload-name">Image</span>
           </label>
+          <span class="muted" style="font-size:14px;">or</span>
+          <input type="text" id="text-search-input" class="input" placeholder="e.g. Man in red jacket" style="flex:1; min-width:200px;">
           <div class="form-group" style="margin:0; display:flex; align-items:center; gap:6px;">
             <label class="muted" style="font-size:12px;">Min Match:</label>
-            <input id="min-match" type="number" class="input" value="50" min="0" max="100" style="width:70px;">
+            <input id="min-match" type="number" class="input" value="20" min="0" max="100" style="width:70px;" title="Text-Image match is typically lower than Image-Image match">
             <span class="muted">%</span>
           </div>
           <button id="upload-search" class="btn primary">Search</button>
@@ -168,26 +169,32 @@
               </tr>
             </thead>
             <tbody id="admin-users-tbody"></tbody>
+            <style>
+              /* Toggle Switch Styles */
+              .switch { position: relative; display: inline-block; width: 44px; height: 22px; }
+              .switch input { opacity: 0; width: 0; height: 0; }
+              .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 34px; }
+              .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+              input:checked + .slider { background-color: var(--primary); }
+              input:checked + .slider:before { transform: translateX(22px); }
+              .form-group.switch-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #333; }
+              .switch-row label { margin-bottom: 0; }
+            </style>
           </table>
         </div>
       </section>
 
-      <!-- ===== Admin: Analytics ===== -->
-      <section id="admin-analytics" class="card admin-only" style="margin-top:24px;">
+      <!-- ===== Analytics (Unlocked) ===== -->
+      <section id="admin-analytics" class="card" style="margin-top:24px;">
         <h3>📈 Analytics</h3>
-        <div class="card-body"
-          style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:16px;">
-          <div class="card">
+        <div class="card-body" style="display:flex; flex-direction:column; gap:24px;">
+          <div class="card chart-card" onclick="zoomChart('chart-time', 'Alerts by Time (24h)')">
             <h4>Alerts by Time (24h)</h4>
-            <div id="chart-time" class="card-body" style="height:120px;"></div>
+            <div id="chart-time" class="card-body" style="height:200px; padding:0 8px; overflow-x:auto; cursor:pointer;"></div>
           </div>
-          <div class="card">
+          <div class="card chart-card" onclick="zoomChart('chart-type', 'Alerts by Type')">
             <h4>Alerts by Type</h4>
-            <div id="chart-type" class="card-body" style="height:120px;"></div>
-          </div>
-          <div class="card">
-            <h4>Severity</h4>
-            <div id="chart-severity" class="card-body" style="height:120px;"></div>
+            <div id="chart-type" class="card-body" style="height:200px; cursor:pointer;"></div>
           </div>
         </div>
       </section>
@@ -213,34 +220,31 @@
             <div class="value" id="meter-net">—</div>
             <div class="label">Network</div>
           </div>
+          <div class="stat-card">
+            <div class="value" id="meter-device" style="font-size:18px; line-height:38px;">—</div>
+            <div class="label">Device</div>
+          </div>
         </div>
       </section>
 
-      <!-- ===== Logs Panel ===== -->
-      <section id="logs" class="card admin-only" style="margin-top:24px;">
-        <h3>📜 Live Logs</h3>
-        <div class="log-controls">
-          <label><input id="lvl-info" type="checkbox" checked> INFO</label>
-          <label><input id="lvl-warn" type="checkbox" checked> WARN</label>
-          <label><input id="lvl-error" type="checkbox" checked> ERROR</label>
-          <label><input id="lvl-debug" type="checkbox"> DEBUG</label>
-          <input id="log-search" class="input" placeholder="Search..." style="width:150px;">
-          <select id="cam-filter" class="select" multiple style="width:120px; height:30px;"></select>
-          <select id="tail-size" class="select" style="width:80px;">
-            <option>200</option>
-            <option selected>500</option>
-            <option>1000</option>
-          </select>
-          <label><input id="auto-scroll" type="checkbox" checked> Auto-scroll</label>
-          <button id="pause-log" class="btn btn-sm">Pause</button>
-          <button id="clear-log" class="btn btn-sm">Clear</button>
-          <button id="export-log" class="btn btn-sm">Export</button>
+      <!-- ===== Admin: Settings ===== -->
+      <section id="settings" class="card admin-only" style="margin-top:24px;">
+        <h3>⚙️ System Settings</h3>
+        <div class="card-body">
+          <div id="settings-form" class="modal-form" style="max-width: 600px;">
+            <!-- Settings injected by JS -->
+            <div class="muted">Loading settings...</div>
+          </div>
+          <div style="margin-top:20px;">
+            <button id="btn-save-settings" class="btn primary">Save All Settings</button>
+          </div>
         </div>
-        <div id="log-body"></div>
+      </section>
+
       </section>
 
       <!-- ===== User: Event Feed ===== -->
-      <section id="user-events" class="card user-only" style="margin-top:24px;">
+      <section id="user-events" class="card" style="margin-top:24px;">
         <h3>🔔 Event Feed
           <select id="events-limit" class="select" style="width:80px; margin-left:auto;">
             <option>20</option>
@@ -251,6 +255,40 @@
         </h3>
         <div id="events-feed" class="card-body"
           style="display:grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap:12px;"></div>
+      </section>
+
+      <!-- ===== 🎬 Video Clips Page ===== -->
+      <section id="clips" class="card" style="margin-top:24px; display:none;">
+        <h3>🎬 Video Clip Generator</h3>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:16px;">
+
+          <!-- Tab 3: Custom Time Frame (Now the only option) -->
+          <div id="clip-page-custom" style="display:block;">
+            <div class="form-group">
+              <label>Camera</label>
+              <select id="clip-page-cam" class="select"></select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Start time</label>
+                <input id="clip-page-start" class="input" type="datetime-local">
+              </div>
+              <div class="form-group">
+                <label>End time</label>
+                <input id="clip-page-end" class="input" type="datetime-local">
+              </div>
+            </div>
+            <p class="muted" style="font-size:11px;margin-top:-6px;">Max duration set by <em>clip_max_seconds</em> in Settings.</p>
+            <button id="clip-page-custom-btn" class="btn primary" style="width:100%;margin-top:8px;">🎬 Generate Custom Clip</button>
+          </div>
+
+          <!-- Shared result area -->
+          <div id="clip-page-result" style="display:none;margin-top:8px;">
+            <hr style="border-color:var(--border);margin-bottom:12px;">
+            <video id="clip-page-video" controls style="width:100%;border-radius:8px;max-height:360px;background:#000;"></video>
+            <a id="clip-page-dl" download="clip.mp4" style="display:block;margin-top:8px;text-align:center;font-size:12px;color:var(--accent);">⬇ Download clip</a>
+          </div>
+        </div>
       </section>
 
     </main>
@@ -270,6 +308,32 @@
 
   <!-- ===== ALERT MODAL (Critical Alerts) ===== -->
   <div id="alert-modal"></div>
+
+  <!-- ===== VIDEO CLIP MODAL ===== -->
+  <div id="clip-modal-overlay" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.8); z-index:9999; align-items:center; justify-content:center;">
+    <div class="card" style="width:90%; max-width:800px; max-height:90vh; overflow-y:auto; position:relative;">
+      <h3 style="display:flex; justify-content:space-between; align-items:center;">
+        <span id="clip-modal-title">📹 Video Clip</span>
+        <button id="clip-modal-close" class="btn btn-sm" style="margin-left:auto;">❌</button>
+      </h3>
+      <div class="card-body" style="text-align:center;">
+        <video id="clip-video-player" controls autoplay style="width:100%; max-height:60vh; background:#000; border-radius:4px; margin-bottom:16px;">
+          Your browser does not support the video tag.
+        </video>
+        <div style="display:flex; justify-content:center; gap:16px; align-items:center; flex-wrap:wrap;">
+          <div class="form-group" style="margin:0; display:flex; align-items:center; gap:6px;">
+            <label class="muted">Before (s):</label>
+            <input id="clip-before" type="number" class="input" value="5" min="1" max="60" style="width:70px;">
+          </div>
+          <div class="form-group" style="margin:0; display:flex; align-items:center; gap:6px;">
+            <label class="muted">After (s):</label>
+            <input id="clip-after" type="number" class="input" value="5" min="1" max="60" style="width:70px;">
+          </div>
+          <button id="clip-reload-btn" class="btn primary">Reload Clip</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Application Script -->
   <script src="js/app.js"></script>

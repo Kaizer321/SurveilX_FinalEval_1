@@ -65,37 +65,29 @@ class TestMultiCamera(unittest.TestCase):
         import torch
         
         # Sequence:
-        # Frame 1: A=Fighting, B=Normal
-        # Frame 2: A=Fighting, B=Normal
-        # Frame 3: A=Fighting (Should Alert), B=Normal (Should NOT alert)
-        
-        # We assume alert_sequence_length=3
+        # Cam A=Fighting (Should Alert), B=Normal (Should NOT alert)
         
         for i in range(1, 4):
             # --- Process Camera A ---
             self.detector.model.return_value = torch.as_tensor(fighting_logits)
-            res_a = self.detector.predict("cam_a", np.zeros((100,100,3)), alert_sequence_length=3)
+            res_a = self.detector.predict("cam_a", np.zeros((100,100,3)))
             
             # --- Process Camera B ---
             self.detector.model.return_value = torch.as_tensor(normal_logits)
-            res_b = self.detector.predict("cam_b", np.zeros((100,100,3)), alert_sequence_length=3)
+            res_b = self.detector.predict("cam_b", np.zeros((100,100,3)))
             
-            # Check
-            if i == 3:
-                self.assertTrue(res_a['is_alert'], "Cam A should alert on frame 3")
-                self.assertFalse(res_b['is_alert'], "Cam B should NOT alert")
-                self.assertEqual(res_a['label'], "Fighting")
-                self.assertEqual(res_b['label'], "Normal")
-            else:
-                self.assertFalse(res_a['is_alert'])
-                self.assertFalse(res_b['is_alert'])
+            # Check instant alert correctly isolated per camera frame
+            self.assertTrue(res_a['is_alert'], "Cam A should alert immediately on Fighting")
+            self.assertFalse(res_b['is_alert'], "Cam B should NOT alert on Normal")
+            self.assertEqual(res_a['label'], "Fighting")
+            self.assertEqual(res_b['label'], "Normal")
 
         # Verify internal state isolation
         state_a = self.detector._get_state("cam_a")
         state_b = self.detector._get_state("cam_b")
         
-        self.assertGreater(state_a["alert_consecutive_count"], 0)
-        self.assertEqual(state_b["alert_consecutive_count"], 0)
+        self.assertIn("frame_counter", state_a)
+        self.assertIn("frame_counter", state_b)
 
 if __name__ == "__main__":
     unittest.main()

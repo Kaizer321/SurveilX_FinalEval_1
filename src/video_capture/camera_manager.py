@@ -1,4 +1,5 @@
 # module1/src/video_capture/camera_manager.py
+import cv2
 import threading
 from yt_dlp import YoutubeDL
 import os
@@ -92,19 +93,32 @@ class CameraManager:
         # URL
         return self._resolve_youtube_url(src) if self._is_youtube(src) else src
 
+    def get_video_capture_args(self, camera_id):
+        """Return (target, apiPreference) for cv2.VideoCapture."""
+        camera_id = str(camera_id)
+        target = self.resolve_target(camera_id)
+        src = self.get_source(camera_id) or ""
+        
+        if isinstance(target, int):
+            # Device: return target and use auto/preferred in VideoCapture
+            return target, None
+        
+        if isinstance(target, str):
+            src_lower = src.lower()
+            if src_lower.startswith(('http', 'rtsp', 'https')):
+                return target, getattr(cv2, 'CAP_FFMPEG', None)
+            
+        return target, None
+
     def connect_camera(self, camera_id):
         """Resolve and register stream URL for a camera."""
         camera_id = str(camera_id)
-        if camera_id not in self.camera_sources:
-            raise ValueError(f"Unknown camera ID: {camera_id}")
-        # For compatibility, store a 'url' even if it's a file/device; VideoCapture uses resolve_target
-        src = self.camera_sources[camera_id]
-        url = self._resolve_youtube_url(src) if self._is_youtube(src) else src
+        url = self.resolve_target(camera_id)
         if camera_id not in self.locks:
             self.locks[camera_id] = threading.Lock()
         with self.locks[camera_id]:
-            self.connections[camera_id] = {"url": url, "status": "connected"}
-        print(f"[CameraManager] Connected {camera_id} -> {url[:60]}...")
+            self.connections[camera_id] = {"url": str(url), "status": "connected"}
+        print(f"[CameraManager] Connected {camera_id} -> {str(url)[:60]}...")
         return url
 
     def disconnect_camera(self, camera_id):

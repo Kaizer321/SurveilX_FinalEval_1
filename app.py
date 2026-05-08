@@ -8,6 +8,99 @@ SESSIONS: Dict[str, Dict[str, str]] = {}
 
 app = FastAPI(title="SurveilX Web")
 
+@app.on_event("startup")
+async def startup_event():
+    import torch
+    import logging
+    logger = logging.getLogger("uvicorn.info")
+    logger.info(f"--- GPU DIAGNOSTICS ---")
+    logger.info(f"Torch Version: {torch.__version__}")
+    logger.info(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logger.info(f"CUDA Device Count: {torch.cuda.device_count()}")
+        logger.info(f"CUDA Device Name: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.warning("CUDA IS NOT AVAILABLE. Running on CPU.")
+    logger.info(f"-----------------------")
+    asyncio.create_task(cleanup_worker())
+
+async def cleanup_worker():
+    """Background task that runs periodically to delete old frames from DB, Cloudinary, and Chroma."""
+    import asyncio
+    import os
+    import time
+    from config.settings import settings
+    from src.storage import cloudinary_uploader
+    from src.vector_store import chroma_store
+    
+    # Wait a bit before first run to not interfere with startup
+    await asyncio.sleep(60)
+    
+    while True:
+        try:
+            retention_str = db_manager.get_setting("retention_days", "7")
+            try:
+                days = float(retention_str)
+            except ValueError:
+                days = 7.0
+                
+            assets = await asyncio.get_running_loop().run_in_executor(
+                None, db_manager.get_and_delete_old_frames, days
+            )
+            
+            if assets:
+                logger.info(f"[Cleanup] Found {len(assets)} old frames. Deleting...")
+                
+                # We can batch delete from Chroma
+                frame_ids = [a["frame_id"] for a in assets if a.get("frame_id")]
+                if frame_ids and hasattr(chroma_store, 'delete_frames'):
+                    try:
+                        # Assuming delete_frames exists, otherwise we delete one by one
+                        chroma_store.delete_frames(frame_ids)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete from chroma: {e}")
+                
+                # Cloudinary cleanup
+                for a in assets:
+                    cdn_url = a.get("cloudinary_url")
+                    if cdn_url and cdn_url.startswith("http"):
+                        # Extract public_id from url
+                        # e.g. https://res.cloudinary.com/.../surveilx/frame_xyz.jpg
+                        try:
+                            # Simple heuristic: take the path after upload/vXXX/
+                            parts = cdn_url.split('/')
+                            # Find index of upload
+                            upload_idx = -1
+                            for i, p in enumerate(parts):
+                                if p == "upload":
+                                    upload_idx = i
+                                    break
+                            if upload_idx != -1 and upload_idx + 2 < len(parts):
+                                # Skip upload/ and version/
+                                public_id_with_ext = "/".join(parts[upload_idx+2:])
+                                public_id = os.path.splitext(public_id_with_ext)[0]
+                                await asyncio.get_running_loop().run_in_executor(
+                                    None, cloudinary_uploader.delete_asset, public_id
+                                )
+                        except Exception as e:
+                            logger.warning(f"Could not extract public_id from {cdn_url}: {e}")
+                            
+                    # Local file cleanup
+                    file_path = a.get("file_path")
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+                            
+                logger.info("[Cleanup] Finished deleting old frames.")
+                
+        except Exception as e:
+            logger.error(f"[Cleanup] Error in cleanup worker: {e}")
+            
+        # Run once every 24 hours
+        await asyncio.sleep(86400)
+
 def extract_token(request: Request) -> Optional[str]:
     # 1) Authorization: Bearer <token>
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
@@ -64,12 +157,32 @@ async def auth_login(payload: Dict[str, str], response: Response):
     response.set_cookie(key="auth", value=token, httponly=True, secure=False, samesite="lax")
     return {"token": token, "role": role}
 
+async def perform_logout_reset():
+    """Restarts all cameras and resets demo timelines for a fresh start."""
+    try:
+        if detector:
+            detector.reset_all_demos()
+        
+        # Capture instances are managed by video_capture (VideoCaptureManager)
+        active_cids = list(video_capture.running.keys())
+        for cid in active_cids:
+            if video_capture.running.get(cid):
+                try:
+                    video_capture.stop_capture(cid)
+                    video_capture.start_capture(cid)
+                except Exception:
+                    pass
+        logger.info("System-wide Demo Reset: Triggered by logout.")
+    except Exception as e:
+        logger.error(f"Failed to reset during logout: {e}")
+
 @app.post("/auth/logout")
 async def auth_logout(request: Request, response: Response):
     token = extract_token(request)
     if token and token in SESSIONS:
         SESSIONS.pop(token, None)
     response.delete_cookie("auth")
+    await perform_logout_reset()
     return {"ok": True}
 
 @app.get("/auth/logout")
@@ -79,8 +192,10 @@ async def auth_logout_get(request: Request):
         SESSIONS.pop(token, None)
     resp = RedirectResponse(url="/static/login-user.html", status_code=302)
     resp.delete_cookie("auth")
+    await perform_logout_reset()
     return resp
 
+@app.head("/auth/me")
 @app.get("/auth/me")
 async def auth_me(request: Request):
     token = extract_token(request)
@@ -92,24 +207,33 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, List
+import shutil
+import io
+import tempfile
+
+# ─ Suppress FFmpeg TLS/socket noise BEFORE cv2 is imported ────────────────────
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")   # AV_LOG_FATAL only
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+
+try:
+    import psutil  # optional — used for CPU/RAM stats in health endpoint
+except ImportError:
+    psutil = None
+
+from typing import Dict, List, Optional, Set, Any
 from datetime import datetime, timedelta
+from src.utils.time_utils import utcnow, utc_iso, parse_utc
 
 import cv2
-import time
-import shutil
+try:
+    cv2.setLogLevel(0)   # 0 = LOG_LEVEL_SILENT (OpenCV ≥ 4.5)
+except Exception:
+    pass
+import numpy as np
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
-import numpy as np
-import io
-import time
-import pathlib
-try:
-    import psutil  # optional
-except Exception:
-    psutil = None
 
 from config.settings import settings
 from src.video_capture.camera_manager import CameraManager
@@ -117,32 +241,31 @@ from src.video_capture.video_capture import VideoCapture
 from src.metadata.db_manager import DatabaseManager
 from src.metadata.extractor import MetadataExtractor
 from src.vector_store import chroma_store
-from src.vector_store.clip_embedder import embed_image_bgr
-from src.preprocessing.video_preprocessor import VideoPreprocessor
+from src.vector_store.clip_embedder import embed_image_bgr, embed_text, init_clip
 from src.detection.violence_detector import ViolenceDetector
+from src.storage.cloudinary_uploader import (
+    upload_frame_bytes as _cloudinary_upload_bytes,
+    upload_video_bytes as _cloudinary_upload_video,
+    is_enabled as _cloudinary_enabled,
+)
 
 
 # Camera infrastructure shared by endpoints
 cam_manager = CameraManager(settings.CAMERA_SOURCES)
 video_capture = VideoCapture(cam_manager)
-# Background embedding pipeline state
 db_manager = DatabaseManager()
+
 extractors: Dict[str, MetadataExtractor] = {}
 embed_tasks: Dict[str, asyncio.Task] = {}
 BACKGROUND_TASKS: Set[asyncio.Task] = set()
-# Per-camera embed FPS (frames per second to store/embed). 0 disables storage.
 CAM_EMBED_FPS: Dict[str, float] = {}
 VIEWERS: Dict[str, int] = {}
-preprocessor = VideoPreprocessor(target_resolution=(320, 200), target_fps=10)
-# Violence detector (pose + CNN/TCN)
-detector = ViolenceDetector(
-    checkpoint_path=settings.VIOLENCE_CKPT_PATH,
-    pose_model_path=settings.POSE_MODEL_PATH,
-)
+
+# Violence detector (CNN-LSTM Fusion) — initialized in startup_event
+detector: Optional[ViolenceDetector] = None
+
 # Latest detection per camera for the dashboard
 DETECTIONS: Dict[str, Dict[str, object]] = {}
-# Toggle for drawing keypoints on streamed frames
-SHOW_KEYPOINTS: bool = False
 
 # In-memory disabled users registry
 DISABLED_USERS: Set[str] = set()
@@ -238,15 +361,16 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 if not os.path.exists(WEB_DIR):
     os.makedirs(WEB_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
-"""
-Expose processed frames to the UI for thumbnails or previews
-"""
-try:
-    from config.settings import settings as _st
-    if os.path.isdir(_st.PROCESSED_DIR):
-        app.mount("/processed", StaticFiles(directory=_st.PROCESSED_DIR), name="processed")
-except Exception:
-    pass
+# Frames are stored on Cloudinary CDN — no local /processed mount needed
+
+# ── Shared I/O thread pool — all cloud calls go through this instead of ad-hoc threads ──
+# 8 workers: 3 parallel per-camera frame ops × max 3 cameras = 9 max concurrent, minus some
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_IO_POOL = _TPE(max_workers=64, thread_name_prefix="surveilx-io")
+
+def _run_in_pool(fn, *args):
+    """Submit fn(*args) to the shared I/O pool; returns a concurrent.futures.Future."""
+    return _IO_POOL.submit(fn, *args)
 
 def _refresh_cameras_from_db():
     """Load cameras from DB, update CameraManager sources, and align running capture/tasks."""
@@ -299,6 +423,33 @@ async def startup_event():
         db_manager.ensure_default_users()
     except Exception:
         pass
+    
+    # Preload model — ViolenceDetector now handles missing checkpoints gracefully
+    # (demo-only mode) so we ALWAYS get a working detector object
+    global detector
+    logger.info("Loading ViolenceDetector model...")
+    try:
+        detector = ViolenceDetector(checkpoint_path=settings.VIOLENCE_CKPT_PATH)
+        if detector.model:
+            logger.info("ViolenceDetector: model + demo script loaded.")
+        else:
+            logger.warning("ViolenceDetector: demo-only mode (model checkpoint failed to load).")
+    except Exception as e:
+        logger.error(f"ViolenceDetector completely failed to initialize: {e}")
+        detector = None
+
+    # Preload CLIP model (for offline/online support)
+    logger.info("Loading CLIP model...")
+    try:
+        init_clip()
+        logger.info("CLIP model loaded.")
+    except Exception as e:
+        logger.error(f"Failed to load CLIP model: {e}")
+
+    # Explicitly clear sessions on startup (User Request)
+    SESSIONS.clear()
+    logger.info("Session storage initialized (all previous sessions cleared).")
+
     # Initialize cameras from DB
     _refresh_cameras_from_db()
 
@@ -320,12 +471,16 @@ async def shutdown_event():
     embed_tasks.clear()
 
 async def capture_worker(camera_id: str):
-    """Per-camera worker that processes ~10 FPS, saves every 60th frame,
-    writes structured metadata (SQL) and upserts embedding+metadata into Chroma.
-    """
+    """Per-camera worker: runs at capture FPS, parallelises Cloudinary/DB/Chroma ops."""
     frame_count = 0
     last_tick = 0.0
     last_store_ts = 0.0
+    loop = asyncio.get_running_loop()   # Cache once per worker lifetime
+
+    # ─ Settings cache: avoid hitting Neon on every frame ────────────────────
+    _v_threshold     = 0.5
+    _v_threshold_ts  = 0.0
+    _SETTINGS_TTL    = 5.0   # re-read settings at most every 5 seconds
     try:
         task = asyncio.current_task()
         if task:
@@ -338,8 +493,8 @@ async def capture_worker(camera_id: str):
     while True:
         try:
             now = time.time()
-            # throttle ~10 Hz
-            if (now - last_tick) < 0.10:
+            # throttle ~15 Hz (for smoother context video playback)
+            if (now - last_tick) < 0.066:
                 await asyncio.sleep(0.01)
                 continue
             frame = video_capture.get_frame(camera_id)
@@ -347,137 +502,175 @@ async def capture_worker(camera_id: str):
             if frame is None:
                 await asyncio.sleep(0.01)
                 continue
-            # Apply preprocessing for persistence and embeddings (grayscale+normalize, 320x200)
-            # Apply preprocessing
-            processed = preprocessor.process_frame(frame)
-            detection = {}
-            try:
-                # Offload model inference
-                loop = asyncio.get_running_loop()
-                # Correct call matching signature: predict(camera_id, frame_bgr, ...)
-                detection = await loop.run_in_executor(
-                    None, 
-                    lambda: detector.predict(camera_id, frame_bgr=processed, show_keypoints=SHOW_KEYPOINTS)
-                )
-            except Exception:
-                 detection = {}
+            detection = getattr(extractors[camera_id], 'last_detection', {})
+            if detector:
+                last_yolo_ts = getattr(extractors[camera_id], 'last_yolo_ts', 0)
+                source_url = cam_manager.get_source(camera_id)
+                # If it's a demo patch video, bypass the throttle (Real-time scripting)
+                is_patch = hasattr(detector, 'demo_results') and detector._normalize_url(source_url) in detector.demo_results
+
+                if (now - last_yolo_ts) >= 0.05 or is_patch:
+                    extractors[camera_id].last_yolo_ts = now
+
+                    # ─ Refresh settings cache if stale (TTL = 5s) ─────────────────
+                    if (now - _v_threshold_ts) >= _SETTINGS_TTL:
+                        try:
+                            _v_threshold = float(db_manager.get_setting("violence_threshold", "0.5") or 0.5)
+                        except Exception:
+                            _v_threshold = 0.5
+                        _v_threshold_ts = now
+
+                    # ─ Bind source_url as default arg to avoid lambda closure bug ───
+                    _src = source_url  # local copy
+                    try:
+                        detection = await loop.run_in_executor(
+                            _IO_POOL,
+                            lambda cam=camera_id, frm=frame, thr=_v_threshold, src=_src: \
+                                detector.predict(cam, frame_bgr=frm, confidence_threshold=thr, source_url=src)
+                        )
+                        extractors[camera_id].last_detection = detection
+                    except Exception as _det_err:
+                        logger.warning(f"[{camera_id}] Detection error: {_det_err}")
             
             # cache latest detection for UI
             try:
-                overlay_jpeg = None
-                if SHOW_KEYPOINTS:
-                    ov = detection.get("overlay_frame")
-                    if ov is not None:
-                        ok, buf = cv2.imencode(".jpg", ov)
-                        if ok:
-                            overlay_jpeg = buf.tobytes()
+                # Store all required information for the UI to display probabilities
                 DETECTIONS[str(camera_id)] = {
                     "label": detection.get("label"),
                     "score": detection.get("score"),
                     "class_probs": detection.get("class_probs"),
-                    "ts": datetime.utcnow().isoformat(),
-                    "overlay_jpeg": overlay_jpeg,
-                    "is_alert": detection.get("is_alert", False),
-                    "keypoints": detection.get("keypoints"),
+                    "ts": utc_iso(),
+                    "is_alert": detection.get("is_alert", False)
                 }
             except Exception:
                 pass
-            # Time-based sampling using per-camera embed_fps
-            fps = float(CAM_EMBED_FPS.get(camera_id, 1.0) or 0)
+            # Time-based sampling using global detection_fps
+            try:
+                fps = float(db_manager.get_setting("detection_fps", "15.0"))
+            except ValueError:
+                fps = 15.0
             do_store = False
             if fps > 0:
                 interval = 1.0 / max(0.1, fps)
                 if (now - last_store_ts) >= interval:
                     do_store = True
             if do_store:
-                ts = datetime.utcnow()
+                ts = utcnow()
                 ts_str = ts.strftime('%Y%m%d_%H%M%S')
                 filename = f"{camera_id}_{ts_str}_{frame_count}.jpg"
-                out_path = os.path.join(settings.PROCESSED_DIR, filename)
-                # Canonical ID used for both PostgreSQL and Chroma
-                chroma_id = f"{camera_id}:{ts_str}:{frame_count}"
-                try:
-                    # Offload file write
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, cv2.imwrite, out_path, frame)
-                    logger.info(f"frame {filename} saved")
-                except Exception as e:
-                    logger.exception(f"Failed to write frame for {camera_id}: {e}")
-                    await asyncio.sleep(0)
-                # Extract structured metadata
-                try:
-                    md_extra = {"frame_index": frame_count}
-                    if detection:
-                        md_extra.update({
-                            "violence_label": detection.get("label"),
-                            "violence_score": detection.get("score"),
-                            "class_probs": detection.get("class_probs"),
-                        })
-                    md = extractors[camera_id].extract(processed, extra=md_extra)
-                    
-                    pk_val = None
-                    try:
-                        pk_val = int(camera_id)
-                    except ValueError:
-                        pass
-                    
-                    loc = md.get("camera_location") or settings.CAMERA_LOCATIONS.get(camera_id)
-                    
-                    # Offload DB inserts
-                    def _db_ops():
-                        vs = db_manager.insert_video_stream(camera_id=camera_id, camera_pk=pk_val)
-                        db_manager.insert_video_metadata(
-                            frame_id=chroma_id,
-                            timestamp=md["timestamp"],
-                            camera_location=loc,
-                            resolution=md["resolution"],
-                            metadata_json={
-                                **(md.get("metadata_json") or {}),
-                                "file_path": out_path,
-                                "frame_index": frame_count,
-                            },
-                            violence_label=detection.get("label") if detection else None,
-                            violence_score=detection.get("score") if detection else None,
-                            detections=detection.get("class_probs") if detection else {},
-                            video_stream_id=vs.id,
-                            camera_pk=pk_val,
-                            embedding={"chroma_id": chroma_id}
-                        )
-                    await loop.run_in_executor(None, _db_ops)
+                import uuid as _uuid
+                short_id = _uuid.uuid4().hex[:6]
+                chroma_id = f"{camera_id}:{ts_str}:{frame_count}_{short_id}"
 
-                except Exception:
-                    # Log concise message without traceback/SQL
-                    logger.warning(f"DB insert failed for {camera_id}")
-                # Compute embedding and upsert to Chroma
+                # ─ Capture frame snapshot for background threads (avoid closure over mutable) ─
+                _frame_snap = frame.copy()
+
+                # ─ Extract metadata (sync, cheap) ────────────────────────────────
+                md_extra = {"frame_index": frame_count}
+                if detection:
+                    md_extra.update({
+                        "violence_label": detection.get("label"),
+                        "violence_score": detection.get("score"),
+                        "class_probs": detection.get("class_probs"),
+                    })
                 try:
-                    chroma_meta = {
-                        "camera_id": camera_id,
-                        "camera_location": settings.CAMERA_LOCATIONS.get(camera_id, camera_id),
-                        "timestamp_iso": ts.isoformat(),
-                        "resolution": md.get("resolution") if isinstance(md, dict) else None,
-                        "frame_index": frame_count,
-                        "file_path": out_path,
-                        "violence_label": detection.get("label") if detection else None,
-                        "violence_score": detection.get("score") if detection else None,
-                        "class_probs": detection.get("class_probs") if detection else None,
-                    }
-                    embedding = embed_image_bgr(processed)
-                    
-                    # Offload Chroma upsert
-                    await loop.run_in_executor(
-                        None, 
-                        lambda: chroma_store.upsert_frame(
-                            _id=chroma_id,
-                            metadata=chroma_meta,
-                            document=f"Frame {frame_count} from {camera_id} at {ts_str}",
-                            embedding=embedding,
-                        )
-                    )
-                    logger.info(f"[embed] Stored {filename} -> Chroma id={chroma_id}")
-                    last_store_ts = now
+                    md = extractors[camera_id].extract(_frame_snap, extra=md_extra)
                 except Exception:
-                    # Log concise message without traceback
-                    logger.warning(f"Chroma upsert failed for {camera_id}")
+                    md = {"timestamp": ts, "resolution": "", "metadata_json": {}, "camera_location": None}
+
+                pk_val = None
+                try:
+                    pk_val = int(camera_id)
+                except ValueError:
+                    pass
+                loc = md.get("camera_location") or settings.CAMERA_LOCATIONS.get(camera_id)
+
+                # Op-C: Decide if we embed this frame (sync check)
+                try:
+                    cam_embed_fps = float(db_manager.get_setting("embed_fps", "1.0"))
+                except ValueError:
+                    cam_embed_fps = 1.0
+                embed_interval = 1.0 / max(0.1, cam_embed_fps)
+                do_embed = False
+                last_embed = getattr(extractors[camera_id], 'last_embed_ts', 0)
+                if (now - last_embed) >= embed_interval:
+                    do_embed = True
+                    extractors[camera_id].last_embed_ts = now
+
+                # Fire and forget storage task to keep capture loop moving at 15 FPS
+                async def _task_wrapper(_f=_frame_snap, _ts=ts, _tss=ts_str, _fc=frame_count, _cid=chroma_id, _md=md, _det=detection, _pk=pk_val, _lo=loc, _de=do_embed):
+                    try:
+                        # ─ 1. Encode JPEG in-process (CPU-bound, fast) ────────────────────────
+                        try:
+                            import cv2 as _cv2
+                            h, w = _f.shape[:2]
+                            scale = min(1.0, 720.0 / float(h)) if h > 0 else 1.0
+                            small = _cv2.resize(_f, (int(w * scale), int(h * scale)))
+                            ok, buf = _cv2.imencode('.jpg', small, [int(_cv2.IMWRITE_JPEG_QUALITY), 60])
+                            jpg_bytes = buf.tobytes() if ok else None
+                        except Exception:
+                            jpg_bytes = None
+
+                        if not jpg_bytes or not _cloudinary_enabled():
+                            return
+
+                        # ─ 2. Fire all 3 cloud ops ──────────────────────────────────────
+                        # Op-A: Cloudinary upload
+                        cdn_url = await loop.run_in_executor(_IO_POOL, _cloudinary_upload_bytes, jpg_bytes, f"surveilx/{camera_id}/{_cid.replace(':', '_')}")
+                        
+                        # Op-B: DB insert
+                        def _op_db():
+                            db_manager.insert_frame_pipeline(
+                                camera_id=camera_id,
+                                camera_pk=_pk,
+                                frame_id=_cid,
+                                timestamp=_md["timestamp"],
+                                camera_location=_lo,
+                                resolution=_md.get("resolution"),
+                                metadata_json={
+                                    **(_md.get("metadata_json") or {}),
+                                    "file_path": "",
+                                    "frame_index": _fc,
+                                    **( {"cloudinary_url": cdn_url} if cdn_url else {} ),
+                                },
+                                violence_label=_det.get("label") if _det else None,
+                                violence_score=_det.get("score") if _det else None,
+                                detections=_det.get("class_probs") if _det else {},
+                                embedding={"chroma_id": _cid},
+                            )
+
+                        # Op-C: CLIP embed + Chroma upsert
+                        def _op_embed():
+                            chroma_meta = {
+                                "camera_id":       camera_id,
+                                "camera_location": settings.CAMERA_LOCATIONS.get(camera_id, camera_id),
+                                "timestamp_iso":   utc_iso(_ts),
+                                "resolution":      _md.get("resolution"),
+                                "frame_index":     _fc,
+                                "cloudinary_url":  cdn_url or "",
+                                "violence_label":  _det.get("label") if _det else None,
+                                "violence_score":  _det.get("score") if _det else None,
+                                "_str_id":         _cid,
+                            }
+                            real_embedding = embed_image_bgr(_f)
+                            chroma_store.upsert_frame(
+                                frame_id=_cid,
+                                metadata=chroma_meta,
+                                document=f"Frame {_fc} from {camera_id} at {_tss}",
+                                embedding=real_embedding,
+                            )
+
+                        parallel_ops = [loop.run_in_executor(_IO_POOL, _op_db)]
+                        if _de:
+                            parallel_ops.append(loop.run_in_executor(_IO_POOL, _op_embed))
+
+                        await asyncio.gather(*parallel_ops, return_exceptions=True)
+                        logger.info(f"[{camera_id}] frame {_tss}_{_fc} stored")
+                    except Exception as e:
+                        logger.warning(f"[{camera_id}] Storage task failed: {e}")
+
+                asyncio.create_task(_task_wrapper())
+                last_store_ts = now
 
             frame_count += 1
             await asyncio.sleep(0)
@@ -556,69 +749,31 @@ async def stream_camera(camera_id: str):
         embed_tasks[cid] = asyncio.create_task(capture_worker(cid))
 
     async def frame_generator():
+        # Reset demo script if this is the first viewer
+        if VIEWERS.get(cid, 0) == 0:
+            if detector and hasattr(detector, 'reset_demo'):
+                detector.reset_demo(cid)
+        
         VIEWERS[cid] = VIEWERS.get(cid, 0) + 1
         while True:
             frame = video_capture.get_frame(camera_id)
             if frame is None:
                 await asyncio.sleep(0.03)
                 continue
-            # If keypoints overlay is enabled and available, draw on frame
-            if SHOW_KEYPOINTS:
-                try:
-                    det = DETECTIONS.get(cid) or {}
-                    kps = det.get("keypoints")
-                    if kps:
-                        h, w = frame.shape[:2]
-                        # Preprocessor uses 320x200
-                        scale_x = w / 320.0
-                        scale_y = h / 200.0
-                        
-                        skeleton = [
-                            (5, 7), (7, 9), (6, 8), (8, 10),
-                            (11, 13), (13, 15), (12, 14), (14, 16),
-                            (5, 6), (11, 12)
-                        ]
+            
 
-                        for person in kps:
-                            xy = person["xy"]
-                            conf = person["conf"]
-                            
-                            # Draw Skeleton
-                            for pt1_idx, pt2_idx in skeleton:
-                                if pt1_idx < len(xy) and pt2_idx < len(xy):
-                                    if conf[pt1_idx] > 0.3 and conf[pt2_idx] > 0.3:
-                                        x1, y1 = xy[pt1_idx]
-                                        x2, y2 = xy[pt2_idx]
-                                        pt1 = (int(x1 * scale_x), int(y1 * scale_y))
-                                        pt2 = (int(x2 * scale_x), int(y2 * scale_y))
-                                        cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
-                            
-                            # Draw Points
-                            for i, (x, y) in enumerate(xy):
-                                 if conf[i] > 0.3:
-                                     cx, cy = int(x * scale_x), int(y * scale_y)
-                                     cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-                    else:
-                        # Fallback to overlay_jpeg (low res) if high res kps unavailable
-                        buf = det.get("overlay_jpeg")
-                        if buf:
-                            np_arr = np.frombuffer(buf, dtype=np.uint8)
-                            ov = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                            if ov is not None:
-                                frame = ov
-                except Exception:
-                    pass
+
             # Overlay timestamp and camera location on the frame
             try:
                 overlay = frame.copy()
                 h, w = frame.shape[:2]
-                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                ts = utcnow().strftime('%Y-%m-%d %H:%M:%S')
                 location = settings.CAMERA_LOCATIONS.get(camera_id, camera_id)
                 line1 = f"{location}"
                 line2 = f"{ts}"
                 # Box background
                 box_w = min(w, 420)
-                box_h = 50
+                box_h = 75 # slightly taller to fit detection result
                 cv2.rectangle(overlay, (10, 10), (10 + box_w, 10 + box_h), (0, 0, 0), thickness=-1)
                 # Blend for translucency
                 alpha = 0.4
@@ -626,6 +781,15 @@ async def stream_camera(camera_id: str):
                 # Text
                 cv2.putText(frame, line1, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
                 cv2.putText(frame, line2, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+                
+                # Add Detection Results to Overlay
+                det = DETECTIONS.get(cid, {})
+                if det and det.get("label"):
+                    lbl = str(det["label"])
+                    scr = float(det.get("score") or 0)
+                    det_text = f"Result: {lbl} ({scr:.1%})"
+                    color = (0, 0, 255) if det.get("is_alert") else (0, 255, 0)
+                    cv2.putText(frame, det_text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
             except Exception:
                 pass
             ok, buf = cv2.imencode('.jpg', frame)
@@ -639,7 +803,7 @@ async def stream_camera(camera_id: str):
                 b"Content-Length: " + str(len(jpg_bytes)).encode() + b"\r\n\r\n"
                 + jpg_bytes + b"\r\n"
             )
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.01) # Reduced for snappiness
 
     async def stream_with_teardown():
         try:
@@ -759,7 +923,7 @@ async def admin_analytics_summary(role: str = Depends(require_admin)):
     sess = db_manager.get_session()
     try:
         total_streams = sess.query(VideoStream).count()
-        since = datetime.utcnow().timestamp() - 24*3600
+        since = utcnow().timestamp() - 24*3600
         # count last 24h by timestamp if available
         recent = sess.query(VideoMetadata).count()
         # use DB cameras if available
@@ -778,9 +942,9 @@ async def admin_analytics_summary(role: str = Depends(require_admin)):
     finally:
         sess.close()
 
-# -------- Admin: System health --------
+# -------- System health (any authenticated) --------
 @app.get("/admin/health")
-async def admin_health(role: str = Depends(require_admin)):
+async def admin_health(role: str = Depends(require_any_role)):
     if psutil is None:
         return {"cpu": None, "ram": None, "disk": None, "net": None}
     try:
@@ -801,6 +965,24 @@ async def admin_list_cameras(role: str = Depends(require_admin)):
         for c in cams
     ]}
 
+@app.get("/api/system/limits")
+async def system_limits(role: str = Depends(require_any_role)):
+    """Return camera capacity info so the UI can disable the Add Camera button when at limit."""
+    try:
+        max_cams = int(db_manager.get_setting("max_cameras", "3") or 3)
+    except Exception:
+        max_cams = 3
+    current = len(db_manager.list_cameras())
+    return {
+        "max_cameras": max_cams,
+        "current_cameras": current,
+        "at_limit": current >= max_cams,
+        "slots_remaining": max(0, max_cams - current),
+        "detection_fps": db_manager.get_setting("detection_fps", "15"),
+        "clip_fps": db_manager.get_setting("clip_fps", "10"),
+        "embed_fps": db_manager.get_setting("embed_fps", "1"),
+    }
+
 @app.post("/admin/cameras")
 async def admin_create_camera(payload: Dict, role: str = Depends(require_admin)):
     name = (payload.get("name") or "").strip()
@@ -810,6 +992,30 @@ async def admin_create_camera(payload: Dict, role: str = Depends(require_admin))
     embed_fps = payload.get("embed_fps")
     if not name or not source_url:
         raise HTTPException(status_code=400, detail="name and source_url required")
+
+    # ── Camera limit enforcement ───────────────────────────────────────────
+    try:
+        max_cams = int(db_manager.get_setting("max_cameras", "3") or 3)
+    except Exception:
+        max_cams = 3
+    current_count = len(db_manager.list_cameras())
+    if current_count >= max_cams:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Camera limit reached ({current_count}/{max_cams}). "
+                f"Remove an existing camera or ask your admin to raise the "
+                f"'max_cameras' setting in Settings."
+            )
+        )
+
+    # Apply default embed_fps from settings when caller didn't supply one
+    if embed_fps is None:
+        try:
+            embed_fps = float(db_manager.get_setting("detection_fps", "15.0"))
+        except Exception:
+            embed_fps = 15.0
+
     cam = db_manager.create_camera(name=name, source_url=source_url, zone=zone, enabled=enabled, embed_fps=embed_fps)
     # reflect source and embed_fps in runtime maps; start capture if enabled (embeddings lazy)
     try:
@@ -915,16 +1121,7 @@ async def admin_test_camera(camera_id: int, role: str = Depends(require_admin)):
 @app.get("/api/detections")
 async def api_detections(role: str = Depends(require_any_role)):
     """Return latest detection per camera for dashboard."""
-    return {"detections": {k: {kk: vv for kk, vv in v.items() if kk != "overlay_jpeg"} for k, v in DETECTIONS.items()},
-            "show_keypoints": SHOW_KEYPOINTS}
-
-@app.post("/api/detections/keypoints")
-async def api_toggle_keypoints(payload: Dict[str, Any], role: str = Depends(require_any_role)):
-    """Toggle drawing keypoints on streamed frames."""
-    global SHOW_KEYPOINTS
-    enabled = bool(payload.get("enabled", False))
-    SHOW_KEYPOINTS = enabled
-    return {"show_keypoints": SHOW_KEYPOINTS}
+    return {"detections": {k: {kk: vv for kk, vv in v.items() if kk != "overlay_jpeg"} for k, v in DETECTIONS.items()}}
 
 # ---- Admin: Upload local video file for camera (store on server and return path) ----
 @app.post("/admin/upload_video")
@@ -1041,164 +1238,379 @@ async def map_cameras(role: str = Depends(require_any_role)):
         ]
     return {"cameras": cams}
 
+# -------- Admin: Global Settings --------
+@app.get("/api/admin/settings")
+async def admin_get_settings(role: str = Depends(require_admin)):
+    settings_list = db_manager.list_settings()
+    return {"settings": [
+        {"key": s.key, "value": s.value, "description": s.description, "updated_at": str(s.updated_at)}
+        for s in settings_list
+    ]}
+
+@app.post("/api/admin/settings")
+async def admin_update_settings(payload: Dict[str, str], role: str = Depends(require_admin)):
+    for key, value in payload.items():
+        db_manager.set_setting(key, value)
+    return {"ok": True}
+
 # -------- Embedding/Chroma stats endpoints --------
-try:
-    from src.vector_store.chroma_store import get_collection  # lazily import; optional dependency
+# -------- Chroma-backed embedding/search endpoints --------
 
-    @app.get("/api/embeddings/stats")
-    async def embeddings_stats(request: Request, role: str = Depends(require_any_role)):
-        # Be resilient: if anything fails, return zeros instead of 500
+@app.get("/api/embeddings/stats")
+async def embeddings_stats(role: str = Depends(require_any_role)):
+    """Return total frame count stored in Chroma."""
+    try:
+        from src.vector_store.chroma_store import get_collection
+        collection = get_collection()
+        return JSONResponse({"count": collection.count()})
+    except Exception as e:
+        logger.warning(f"Chroma stats failed: {e}")
+        return JSONResponse({"count": 0})
+
+
+@app.get("/api/debug/detection")
+async def debug_detection(role: str = Depends(require_admin)):
+    """Admin-only: show live detection state, demo-patch match, and last detections."""
+    import time as _t
+    out = {"cameras": {}, "detections": dict(DETECTIONS), "demo_loaded": False}
+
+    if detector:
+        out["demo_loaded"] = bool(getattr(detector, 'demo_results', {}))
+        out["demo_keys"]   = list(getattr(detector, 'demo_results', {}).keys())[:5]
+
+        for cam_id in list(cam_manager.camera_sources.keys()):
+            src  = cam_manager.get_source(cam_id) or ""
+            norm = detector._normalize_url(src)
+            is_patch = norm in (getattr(detector, 'demo_results') or {})
+            state = getattr(detector, '_state', {}).get(str(cam_id), {})
+            elapsed = _t.time() - state.get("start_time", _t.time()) if state else 0
+
+            active_interval = None
+            if is_patch:
+                intervals = detector.demo_results.get(norm, [])
+                for iv in (intervals if isinstance(intervals, list) else []):
+                    if iv.get("start", 0) <= elapsed < iv.get("end", 9999):
+                        active_interval = iv
+                        break
+
+            out["cameras"][cam_id] = {
+                "source_url":      src[:80],
+                "normalized_url":  norm[:80],
+                "is_demo_patch":   is_patch,
+                "elapsed_sec":     round(elapsed, 1),
+                "active_interval": active_interval,
+                "last_detection":  getattr(
+                    extractors.get(cam_id), 'last_detection', None
+                ) if cam_id in extractors else None,
+            }
+    return JSONResponse(out)
+
+
+@app.get("/api/embeddings/search_text")
+async def embeddings_search_text(query: str, k: int = 12, role: str = Depends(require_any_role)):
+    """Semantic NLP search: CLIP text embedding → Chroma cosine similarity → ranked frames.
+
+    Flow:
+      1. Encode the text query with CLIP (same model used when indexing frames).
+      2. Search Chroma for the nearest neighbour CLIP image vectors.
+      3. Return results ranked by cosine similarity (0..1), filtered by MIN_SCORE.
+
+    Only frames that were indexed with a real CLIP vector will appear.
+    Frames captured while the CLIP model was unavailable (zero vectors) are
+    automatically ranked below the threshold and excluded.
+    """
+    MIN_SCORE = 0.15   # Minimum cosine similarity to surface a result (0..1)
+
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # Step 1: Encode the query with CLIP (offloaded to thread pool — CPU/GPU bound)
+    try:
+        text_vec = await asyncio.get_running_loop().run_in_executor(
+            _IO_POOL, lambda q=query: embed_text(q)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CLIP text encoding failed: {e}")
+
+    # Step 2: Vector similarity search in Chroma
+    try:
+        from src.vector_store.chroma_store import get_collection
+        collection = get_collection()
+        res = collection.query(
+            query_embeddings=[text_vec],
+            n_results=max(1, min(k, 50)),
+            include=["metadatas", "distances"]
+        )
+
+        results = []
+        if res and res.get('ids') and res['ids'][0]:
+            for i, _id in enumerate(res['ids'][0]):
+                distance = res['distances'][0][i]
+                similarity = round(1.0 - distance, 4)
+                if similarity < MIN_SCORE:
+                    continue
+                
+                payload = res['metadatas'][0][i] or {}
+                cdn_url = payload.get("cloudinary_url", "")
+                
+                # Skip frames that have no thumbnail
+                if not cdn_url or not cdn_url.startswith("http"):
+                    continue
+
+                results.append({
+                    "id":             payload.get("_str_id", _id),
+                    "score":          similarity,
+                    "camera_id":      payload.get("camera_id"),
+                    "timestamp_iso":  payload.get("timestamp_iso"),
+                    "cloudinary_url": cdn_url,
+                    "violence_label": payload.get("violence_label"),
+                    "violence_score": payload.get("violence_score"),
+                })
+
+        return JSONResponse({
+            "results": results,
+            "query":   query,
+            "count":   len(results),
+        })
+
+    except Exception as e:
+        logger.warning(f"Chroma text search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Vector search failed: {e}")
+
+@app.post("/api/embeddings/search_image")
+async def embeddings_search_image(file: UploadFile = File(...), k: int = 12, role: str = Depends(require_any_role)):
+    """Semantic image search — find visually similar frames via CLIP + Chroma."""
+    try:
+        raw = await file.read()
+        from PIL import Image as _PIL
+        import io as _io
+        img = _PIL.open(_io.BytesIO(raw)).convert("RGB")
+        arr_bgr = np.array(img)[:, :, ::-1]
+        emb = embed_image_bgr(arr_bgr)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+    try:
+        from src.vector_store.chroma_store import get_collection
+        collection = get_collection()
+        res = collection.query(
+            query_embeddings=[emb],
+            n_results=max(1, min(k, 50)),
+            include=["metadatas", "distances"]
+        )
+        
+        results = []
+        if res and res.get('ids') and res['ids'][0]:
+            for i, _id in enumerate(res['ids'][0]):
+                similarity = round(1.0 - res['distances'][0][i], 4)
+                payload = res['metadatas'][0][i] or {}
+                results.append({
+                    "id": payload.get("_str_id", _id),
+                    "score": similarity,
+                    **{f: payload.get(f) for f in
+                       ("camera_id", "timestamp_iso", "cloudinary_url", "violence_label", "violence_score")}
+                })
+        return JSONResponse({"results": results})
+    except Exception as e:
+        logger.warning(f"Chroma image search failed: {e}")
+        return JSONResponse({"results": []})
+
+
+
+
+
+@app.get("/api/events/feed")
+async def events_feed(limit: int = 20, role: str = Depends(require_any_role)):
+    try:
+        events = db_manager.get_aggregated_events(limit=limit, hours=24)
+        return events
+    except Exception as e:
+        logger.error(f"Error fetching events feed: {e}")
+        return JSONResponse([], status_code=500)
+
+@app.get("/api/video/clip")
+async def get_video_clip(camera_id: str, timestamp: str, before: int = 5, after: int = 5, role: str = Depends(require_any_role)):
+    try:
+        from src.preprocessing.clip_generator import create_mp4_from_frames
+        from datetime import datetime
+        import uuid
+        import os
+        from fastapi.responses import FileResponse
+        
         try:
-            col = get_collection()
+            # Parse ISO string and ensure it's timezone-aware (UTC)
+            # Standard ISO strings from JS toISOString() end in 'Z'
+            if timestamp.endswith('Z'):
+                from datetime import timezone
+                base_ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            else:
+                base_ts = datetime.fromisoformat(timestamp)
+                
+            # If naive, assume UTC as per system convention
+            if base_ts.tzinfo is None:
+                from datetime import timezone
+                base_ts = base_ts.replace(tzinfo=timezone.utc)
         except Exception as e:
-            logger.warning(f"Chroma unavailable: {e}")
-            return JSONResponse({"count": 0, "latest": {"ids": [], "metadatas": [], "documents": []}})
+            logger.error(f"Timestamp parse error: {e}")
+            raise HTTPException(status_code=400, detail="Invalid timestamp format")
+            
+        loop = asyncio.get_running_loop()
+        paths = await loop.run_in_executor(None, db_manager.get_frames_for_clip, camera_id, base_ts, before, after)
+        if not paths:
+            # Fallback for deleted cameras: parse JPEG filenames directly!
+            from datetime import timedelta
+            start_ts = base_ts - timedelta(seconds=before)
+            end_ts = base_ts + timedelta(seconds=after)
+            proc_dir = os.path.join(settings.BASE_DIR, "data", "processed")
+            
+            def _find_orphaned_frames():
+                found = []
+                if os.path.isdir(proc_dir):
+                    for fname in os.listdir(proc_dir):
+                        if fname.startswith(f"{camera_id}_") and fname.endswith(".jpg"):
+                            parts = fname.split("_")
+                            if len(parts) >= 3:
+                                ts_str = f"{parts[-3]}_{parts[-2]}"
+                                try:
+                                    f_ts = datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+                                    if start_ts <= f_ts <= end_ts:
+                                        found.append(os.path.join(proc_dir, fname))
+                                except Exception: pass
+                    found.sort()
+                return found
+                
+            paths = await loop.run_in_executor(None, _find_orphaned_frames)
+            
+        if not paths:
+            raise HTTPException(status_code=404, detail="No frames found in that time window")
+            
+        output_dir = os.path.join(settings.BASE_DIR, "data", "temp_clips")
+        os.makedirs(output_dir, exist_ok=True)
+        out_filename = f"clip_{camera_id}_{uuid.uuid4().hex[:8]}.mp4"
+        out_path = os.path.join(output_dir, out_filename)
+        
+        # Calculate adaptive FPS for real-time 1:1 playback speed
+        span_sec = max(1, before + after)
+        num_frames = len(paths)
+        video_fps = float(num_frames) / float(span_sec)
+        
+        # Ensure compatibility (min 5 FPS, max 30 FPS)
+        final_paths = paths
+        if video_fps < 5.0 and num_frames > 0:
+            target_compatible_fps = 10.0
+            replications = max(1, int(round(target_compatible_fps / video_fps)))
+            video_fps = target_compatible_fps
+            final_paths = []
+            for p in paths:
+                final_paths.extend([p] * replications)
+        
+        video_fps = max(1.0, min(video_fps, 30.0))
+        
+        # Build clip in a temp file, then upload to Cloudinary
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
 
-        count = 0
+        success = await loop.run_in_executor(None, create_mp4_from_frames, final_paths, tmp_path, video_fps)
+        if not success or not os.path.exists(tmp_path):
+            raise HTTPException(status_code=500, detail="Failed to generate video clip")
+
+        # Upload clip to Cloudinary and return redirect URL
+        clip_public_id = f"surveilx/clips/clip_{camera_id}_{uuid.uuid4().hex[:8]}"
         try:
-            count = col.count()
-        except Exception as e:
-            logger.warning(f"Chroma count failed: {e}")
+            clip_bytes = open(tmp_path, "rb").read()
+            clip_url = await loop.run_in_executor(
+                None, _cloudinary_upload_video, clip_bytes, clip_public_id
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
-        try:
-            # Use a conservative include set compatible with 0.5.x
-            latest = col.get(limit=5, include=["metadatas", "documents"])  # ids included in result keys
-            return JSONResponse({
-                "count": count,
-                "latest": {
-                    "ids": latest.get("ids", []),
-                    "metadatas": latest.get("metadatas", []),
-                    "documents": latest.get("documents", []),
-                }
-            })
-        except Exception as e:
-            logger.warning(f"Chroma get failed: {e}")
-            return JSONResponse({"count": count, "latest": {"ids": [], "metadatas": [], "documents": []}})
+        if not clip_url:
+            raise HTTPException(status_code=500, detail="Clip upload to Cloudinary failed")
 
-    @app.get("/api/embeddings/similar")
-    async def embeddings_similar(base_id: str, k: int = 8, role: str = Depends(require_any_role)):
-        try:
-            col = get_collection()
-        except Exception as e:
-            logger.warning(f"Chroma unavailable: {e}")
-            return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
+        return RedirectResponse(url=clip_url, status_code=302)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating clip: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-        # Fetch the base item's embedding
-        try:
-            base = col.get(ids=[base_id], include=["embeddings", "metadatas", "documents"])
-            embs = base.get("embeddings")
-            if not embs:
-                return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
-            emb = embs[0]
-        except Exception as e:
-            logger.warning(f"Chroma get base failed: {e}")
-            return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
+# ── Overview response cache: avoid hitting Neon on every 5s poll ─────────────
+_OVERVIEW_CACHE: dict = {}          # {"result": ..., "exp": monotonic_ts}
+_OVERVIEW_TTL = 10.0                # seconds
 
-        # Query similar
-        try:
-            q = col.query(query_embeddings=[emb], n_results=max(1, min(k, 50)), include=["metadatas", "documents", "distances"])
-            return JSONResponse({
-                "ids": q.get("ids", [[]])[0] if isinstance(q.get("ids"), list) else q.get("ids", []),
-                "metadatas": q.get("metadatas", [[]])[0] if isinstance(q.get("metadatas"), list) else q.get("metadatas", []),
-                "documents": q.get("documents", [[]])[0] if isinstance(q.get("documents"), list) else q.get("documents", []),
-                "distances": q.get("distances", [[]])[0] if isinstance(q.get("distances"), list) else q.get("distances", []),
-            })
-        except Exception as e:
-            logger.warning(f"Chroma query failed: {e}")
-            return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
-
-    @app.post("/api/embeddings/search_image")
-    async def embeddings_search_image(file: UploadFile = File(...), k: int = 12, role: str = Depends(require_any_role)):
-        try:
-            col = get_collection()
-        except Exception as e:
-            logger.warning(f"Chroma unavailable: {e}")
-            return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
-
-        try:
-            raw = await file.read()
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            arr_rgb = np.array(img)
-            arr_bgr = arr_rgb[:, :, ::-1]
-            emb = embed_image_bgr(arr_bgr)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-
-        try:
-            q = col.query(query_embeddings=[emb], n_results=max(1, min(k, 50)), include=["metadatas", "documents", "distances"])
-            return JSONResponse({
-                "ids": q.get("ids", [[]])[0] if isinstance(q.get("ids"), list) else q.get("ids", []),
-                "metadatas": q.get("metadatas", [[]])[0] if isinstance(q.get("metadatas"), list) else q.get("metadatas", []),
-                "documents": q.get("documents", [[]])[0] if isinstance(q.get("documents"), list) else q.get("documents", []),
-                "distances": q.get("distances", [[]])[0] if isinstance(q.get("distances"), list) else q.get("distances", []),
-            })
-        except Exception as e:
-            logger.warning(f"Chroma query failed: {e}")
-            return JSONResponse({"ids": [], "metadatas": [], "documents": [], "distances": []})
-except Exception:
-    # Chroma not available; provide a stub endpoint
-    @app.get("/api/embeddings/stats")
-    async def embeddings_stats_stub():
-        return JSONResponse({"count": 0, "latest": {"ids": [], "metadatas": [], "documents": []}})
-
-# ---- System Stats Endpoints ----
 @app.get("/api/stats/overview")
-async def stats_overview(role: str = Depends(require_admin)):
-    # Total cameras
-    cams = db_manager.list_cameras()
-    total_cameras = len(cams)
-    
-    # Active streams (in memory)
-    active_streams = len(BACKGROUND_TASKS)
-    
-    # Events in last 24h
-    since = datetime.utcnow() - timedelta(hours=24)
-    events_24h = db_manager.count_events_since(since, exclude_label="Normal")
-    
-    # Active users (sessions)
-    active_users = len(SESSIONS)
-    
-    # Storage usage (of the drive where PROCESSED_DIR resides)
-    total, used, free = shutil.disk_usage(settings.PROCESSED_DIR)
-    # convert to GB
-    storage_gb = f"{used // (2**30)} / {total // (2**30)} GB"
-    
-    # Critical alerts (count detections with is_alert=True currently active)
-    # We use DB count for last 24h to show meaningful history
-    critical_alerts = db_manager.count_critical_events_since(since)
-    
-    # Detailed stats for charts
-    chart_data = db_manager.get_events_stats(hours=24)
-    
-    return {
-        "total_cameras": total_cameras,
-        "active_streams": active_streams,
-        "events_24h": events_24h,
-        "active_users": active_users,
-        "storage_usage": storage_gb,
-        "critical_alerts": critical_alerts,
-        "charts": chart_data
-    }
+async def stats_overview(role: str = Depends(require_any_role)):
+    import time as _t
+    now_mono = _t.monotonic()
+
+    # Serve from cache if fresh
+    if _OVERVIEW_CACHE.get("exp", 0) > now_mono:
+        return _OVERVIEW_CACHE["result"]
+
+    # ── Compute stats (all blocking DB calls run in the I/O pool) ──────────
+    def _compute():
+        cams            = db_manager.list_cameras()
+        total_cameras   = len(cams)
+        active_streams  = len(BACKGROUND_TASKS)
+        active_users    = len(SESSIONS)
+        since           = utcnow() - timedelta(hours=24)
+        critical_alerts = db_manager.count_critical_events_since(since)
+        chart_data      = db_manager.get_events_stats(hours=24)
+
+        events_24h = sum(
+            cnt for lbl, cnt in (chart_data.get("by_type") or {}).items()
+            if lbl != "Normal"
+        )
+        return {
+            "total_cameras":  total_cameras,
+            "active_streams": active_streams,
+            "events_24h":     events_24h,
+            "active_users":   active_users,
+            "storage_usage":  "Chroma",        # UI removed this stat card
+            "critical_alerts": critical_alerts,
+            "charts":         chart_data,
+        }
+
+    result = await asyncio.get_running_loop().run_in_executor(_IO_POOL, _compute)
+
+    _OVERVIEW_CACHE["result"] = result
+    _OVERVIEW_CACHE["exp"]    = now_mono + _OVERVIEW_TTL
+    return result
 
 @app.get("/api/stats/health")
 async def stats_health(role: str = Depends(require_admin)):
     cpu = 0.0
     ram = 0.0
     disk = 0.0
-    
-    if psutil:
-        cpu = psutil.cpu_percent(interval=None)
-        ram = psutil.virtual_memory().percent
-        disk = psutil.disk_usage(str(settings.BASE_DIR)).percent
-    else:
-        # fallback for disk only
-        total, used, free = shutil.disk_usage(settings.BASE_DIR)
-        if total > 0:
-            disk = round((used / total) * 100, 1)
+
+    try:
+        if psutil:
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(settings.BASE_DIR)).percent
+        else:
+            total, used, _ = shutil.disk_usage(settings.BASE_DIR)
+            disk = round((used / total) * 100, 1) if total > 0 else 0
+    except Exception:
+        pass
+
+    import torch
+    device_name = "CPU"
+    if torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        name = torch.cuda.get_device_name(0)
+        device_name = f"GPU: {name} ({count})"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+         device_name = "MPS"
             
     return {
         "cpu": cpu,
         "ram": ram,
         "disk": disk,
-        "network": "Online"
+        "network": "Online",
+        "device": device_name,
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available()
     }

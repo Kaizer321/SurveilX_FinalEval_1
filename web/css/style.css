@@ -142,15 +142,44 @@ img {
     left: 0;
     height: 100vh;
     z-index: 100;
-    transition: transform 0.3s ease;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s ease;
+}
+
+.sidebar.collapsed {
+    width: 60px;
 }
 
 .sidebar-header {
-    padding: 20px;
+    padding: 12px 14px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
-    gap: 12px;
+    justify-content: space-between;
+    gap: 8px;
+    height: 60px;
+}
+
+.sidebar-toggle-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px;
+    border-radius: var(--radius-sm);
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.sidebar-toggle-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+}
+
+.sidebar.collapsed .sidebar-title {
+    display: none;
 }
 
 .sidebar-header .logo {
@@ -197,6 +226,20 @@ img {
 .nav a:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+}
+
+.sidebar.collapsed .nav a {
+    justify-content: center;
+    padding: 12px 0;
+}
+
+.sidebar.collapsed .nav a .label {
+    display: none;
+}
+
+.sidebar.collapsed .nav a .icon {
+    font-size: 20px;
+    margin: 0;
 }
 
 .nav a.active {
@@ -255,12 +298,31 @@ img {
     letter-spacing: 0.5px;
 }
 
+.sidebar.collapsed .user-details,
+.sidebar.collapsed .logout-btn .label {
+    display: none;
+}
+
+.sidebar.collapsed .user-info {
+    justify-content: center;
+    padding: 8px 0;
+}
+
+.sidebar.collapsed .logout-btn {
+    padding: 10px 0;
+}
+
 /* ----- Main Content ----- */
 .main {
     flex: 1;
     margin-left: var(--sidebar-width);
     padding: 24px;
     min-height: 100vh;
+    transition: margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+body.sidebar-folded .main {
+    margin-left: 60px;
 }
 
 /* ============================================
@@ -426,8 +488,13 @@ img {
     color: var(--accent-light);
 }
 
-.btn:active:not(:disabled) {
+.btn:active:not(:disabled),
+.btn.active:not(:disabled) {
     transform: scale(0.97);
+    background: var(--bg-tertiary);
+    border-color: var(--accent);
+    color: var(--accent-light);
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .btn:disabled {
@@ -919,19 +986,8 @@ tbody tr:hover {
 /* ============================================
    17. RESPONSIVE
    ============================================ */
+/* Responsive adjustments */
 @media (max-width: 1024px) {
-    .sidebar {
-        transform: translateX(-100%);
-    }
-
-    .sidebar.open {
-        transform: translateX(0);
-    }
-
-    .main {
-        margin-left: 0;
-    }
-
     #cams {
         grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     }
@@ -1025,4 +1081,175 @@ tbody tr:hover {
     50% {
         box-shadow: 0 0 25px rgba(239, 68, 68, 0.5);
     }
+}
+
+/* ============================================
+   14. CONFIDENCE OVERLAY
+   ============================================ */
+.cam-probs {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(to top, rgba(0, 0, 0, 0.9) 0%, rgba(0, 0, 0, 0.6) 80%, transparent 100%);
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    z-index: 10;
+    pointer-events: none;
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+    opacity: 1;
+    visibility: visible;
+}
+
+.cam-probs.hidden,
+body.overlay-hide .cam-probs {
+    opacity: 0 !important;
+    visibility: hidden !important;
+    display: flex !important;
+    /* Keep in DOM for instant transition */
+}
+
+.probs-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--text-primary);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.probs-label {
+    width: 60px;
+    text-transform: capitalize;
+    font-weight: 500;
+}
+
+.probs-bar-track {
+    flex: 1;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    overflow: hidden;
+    backdrop-filter: blur(2px);
+}
+
+.probs-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.probs-val {
+    width: 32px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+}
+
+/* ============================================
+   14. CHARTS & VISUALIZATION
+   ============================================ */
+.chart-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    height: 180px; /* Professional height */
+    padding-bottom: 30px; /* Sufficient space for labels */
+    overflow-x: auto;
+    overflow-y: visible;
+}
+
+.chart-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    position: relative;
+    cursor: default;
+    overflow: visible;
+    min-width: 35px;
+}
+
+.chart-col:hover .bar-stack {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.bar-stack {
+    width: 100%;
+    height: 120px; /* Fixed height for the numeric data area */
+    display: flex;
+    flex-direction: column-reverse;
+    justify-content: flex-start;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    overflow: hidden;
+    transition: background 0.2s;
+}
+
+.chk-label {
+    display: block;
+    text-align: center;
+    width: 100%;
+    padding-top: 12px;
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.chart-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.chart-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+}
+
+.chart-row .label {
+    width: 80px;
+    color: var(--text-secondary);
+}
+
+.chart-row .track {
+    flex: 1;
+    height: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.chart-row .fill {
+    height: 100%;
+    border-radius: 4px;
+}
+
+.chart-row .val {
+    width: 30px;
+    text-align: right;
+    font-weight: 600;
+}
+
+/* New Utility Classes for Charts */
+.bg-success {
+    background: var(--success);
+}
+
+.bg-error {
+    background: var(--error);
+}
+
+.bg-warn {
+    background: var(--warning);
+}
+
+.bg-primary {
+    background: var(--accent);
 }

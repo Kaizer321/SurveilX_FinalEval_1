@@ -22,26 +22,16 @@ class Settings:
     if not DB_URL:
         raise ValueError("SURVEILX_DB_URL environment variable not set")
     
-    # ChromaDB Configuration
-    CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    # Vector DB (Chroma) — configured via CHROMA_HOST / CHROMA_TOKEN in .env
     
-    # Camera Configuration
-    CAMERA_SOURCES = {
-        "cam1": "https://www.youtube.com/watch?v=rnXIjl_Rzy4&pp=ygUZbGl2ZSBjY3R2IGNhbWVyYSBmb290YWdlcw%3D%3D",
-        "cam2": "https://www.youtube.com/watch?v=tujkoXI8rWM",
-    }
-    
-    CAMERA_LOCATIONS = {
-        "cam1": "Floor 1 - Lobby",
-        "cam2": "Floor 2 - Lobby",
-    }
+    # Camera Configuration (Loaded natively from DB now)
+    CAMERA_SOURCES = {}
+    CAMERA_LOCATIONS = {}
     
     # Detection/pose models
     MODELS_DIR = BASE_DIR / "models"
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    VIOLENCE_CKPT_PATH = Path(os.getenv("VIOLENCE_CKPT_PATH", str(MODELS_DIR / "cnn_tcn_fusion.pth")))
-    POSE_MODEL_PATH = Path(os.getenv("POSE_MODEL_PATH", str(MODELS_DIR / "yolov8n-pose.pt")))
+    VIOLENCE_CKPT_PATH = Path(os.getenv("VIOLENCE_CKPT_PATH", str(MODELS_DIR / "cnn_lstm_fusion.pth")))
     
     # Storage Directories
     DATA_DIR = BASE_DIR / "data"
@@ -52,12 +42,6 @@ class Settings:
     for directory in [OUTPUT_DIR, PROCESSED_DIR]:
         directory.mkdir(parents=True, exist_ok=True)
     
-    # Application Settings
-    FRAME_RATE = int(os.getenv("FRAME_RATE", "1"))  # Frames per second to process
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))  # Number of worker threads
-    
-    # Model Configuration
-    MODEL_NAME = os.getenv("MODEL_NAME", "ViT-B/32")  # Default to CLIP ViT-B/32
     
     # Logging Configuration
     LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -84,4 +68,4 @@ logging.basicConfig(
 
 # Log database connection info (with masked password)
 logging.getLogger(__name__).info(f"Database URL: {settings.database_url}")
-logging.getLogger(__name__).info(f"ChromaDB directory: {settings.CHROMA_DIR}")
+logging.getLogger(__name__).info(f"Chroma host: {os.getenv('CHROMA_HOST', 'not set')}")

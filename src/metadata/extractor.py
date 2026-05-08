@@ -1,9 +1,8 @@
 # module1/src/metadata/extractor.py
 import cv2
-import time
-import json
 from datetime import datetime
 from config.settings import settings
+from src.utils.time_utils import utcnow
 
 class MetadataExtractor:
     """
@@ -51,7 +50,7 @@ class MetadataExtractor:
         - codec, bitrate if available
         - extra: user-supplied metadata dict
         """
-        ts = datetime.utcnow()
+        ts = utcnow()
         md = {
             "timestamp": ts,
             "camera_id": self.camera_id,

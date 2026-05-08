@@ -7,7 +7,7 @@ class VideoPreprocessor:
     Handles preprocessing tasks for standardizing and enhancing video frames.
     """
 
-    def __init__(self, target_resolution=(320, 200), target_fps=30, output_format="mp4"):
+    def __init__(self, target_resolution=(320, 240), target_fps=15, output_format="mp4"):
         self.target_resolution = target_resolution
         self.target_fps = target_fps
         self.output_format = output_format
@@ -20,11 +20,44 @@ class VideoPreprocessor:
             frame = cv2.convertScaleAbs(frame)
         return frame
 
-    def normalize_resolution(self, frame):
-        """Resize frame to target resolution."""
+    @staticmethod
+    def resize_with_padding(frame, target_resolution):
+        """Resize frame to target resolution while maintaining aspect ratio via padding."""
         if frame is None:
             return None
-        return cv2.resize(frame, self.target_resolution)
+            
+        target_w, target_h = target_resolution
+        h, w = frame.shape[:2]
+        
+        # Calculate scale to fit within target dimensions
+        scale = min(target_w / w, target_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        resized = cv2.resize(frame, (new_w, new_h))
+        
+        # Calculate padding
+        top = (target_h - new_h) // 2
+        bottom = target_h - new_h - top
+        left = (target_w - new_w) // 2
+        right = target_w - new_w - left
+        
+        # Apply padding (black bars)
+        padded = cv2.copyMakeBorder(
+            resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=[0, 0, 0]
+        )
+        return padded
+
+    @staticmethod
+    def ensure_even_dimensions(width, height):
+        """Fix dimensions to even numbers (H264 codec requirement)."""
+        if width % 2 != 0: width -= 1
+        if height % 2 != 0: height -= 1
+        return width, height
+
+    def normalize_resolution(self, frame):
+        """Resize frame to target resolution while maintaining aspect ratio via padding."""
+        return self.resize_with_padding(frame, self.target_resolution)
 
     def adjust_frame_rate(self, frames, original_fps):
         """

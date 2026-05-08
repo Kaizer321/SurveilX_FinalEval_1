@@ -40,10 +40,19 @@ class Camera(Base):
     enabled = Column(Boolean, default=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     # Target frames-per-second for embedding/storage (per camera)
-    embed_fps = Column(Integer, default=1)
+    embed_fps = Column(Integer, default=15)
 
     streams = relationship("VideoStream", back_populates="camera", cascade="all, delete-orphan")
     metadata_entries = relationship("VideoMetadata", back_populates="camera", cascade="all, delete-orphan")
+
+class GlobalSetting(Base):
+    __tablename__ = "global_settings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(100), unique=True, nullable=False, index=True)
+    value = Column(String(512), nullable=False)
+    description = Column(String(255))
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 class VideoMetadata(Base):
     __tablename__ = "video_metadata"
@@ -53,14 +62,14 @@ class VideoMetadata(Base):
     # Direct link to camera as well for easier querying/joins
     camera_pk = Column(Integer, ForeignKey("cameras.id"), nullable=True, index=True)
     frame_id = Column(String(200), unique=True, index=True, nullable=False)
-    timestamp = Column(TIMESTAMP, nullable=False)
+    timestamp = Column(TIMESTAMP(timezone=True), nullable=False)
     camera_location = Column(String(100))
     resolution = Column(String(20))
     # future-friendly fields for detection & vector search
     violence_label = Column(String(50))           # e.g., shooting, burglary, fighting, stealing
     violence_score = Column(Float)                # model confidence
     detections = Column(JSON, default={})         # arbitrary detection payloads
-    # embeddings are stored in external Chroma DB; keep optional cache fields
+    # embeddings are stored in Chroma Cloud; keep optional cache fields
     embedding = Column(JSON, default=None)        # optional cached embedding vector
     embedding_model = Column(String(100), default="clip", server_default="clip")  # model name used
     metadata_json = Column(JSON, default={})

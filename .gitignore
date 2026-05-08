@@ -26,6 +26,16 @@ build/
 chroma_db/
 uploads/
 models/
-data/
+data/processed/
+data/temp_clips/
+data/output/
 *.zip
 *.rar
+*.log
+*.sqlite
+*.db
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
