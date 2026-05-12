@@ -110,5 +110,4 @@ Visit `http://localhost:8000` to access the dashboard.
 ## 📜 License
 Academic/Educational Use Only. 
 
----
-Developed with ❤️ by **Abdullah**
+
