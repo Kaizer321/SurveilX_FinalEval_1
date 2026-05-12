@@ -1,0 +1,17 @@
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+node_modules
+temp_frontend/node_modules
+temp_frontend/dist
+.env
+.env.*
+chroma_db
+venv/
+temp_frontend_backup
+.git
+.gitignore
+tests/output

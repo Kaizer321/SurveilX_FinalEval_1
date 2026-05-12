@@ -2,11 +2,23 @@
 from typing import Optional, Dict, Set, Any
 from fastapi import Request, Response, Depends  # early import for type usage below
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import secrets
 
 SESSIONS: Dict[str, Dict[str, str]] = {}
 
 app = FastAPI(title="SurveilX Web")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 async def startup_event():
@@ -573,6 +585,19 @@ async def capture_worker(camera_id: str):
                 # ─ Capture frame snapshot for background threads (avoid closure over mutable) ─
                 _frame_snap = frame.copy()
 
+                # Persist the processed frame immediately so it survives even if the async task fails
+                local_path = None
+                try:
+                    from pathlib import Path as _Path
+                    processed_dir = _Path(settings.PROCESSED_DIR)
+                    processed_dir.mkdir(parents=True, exist_ok=True)
+                    local_path = processed_dir / f"{camera_id}_{ts_str}_{frame_count}.jpg"
+                    ok = cv2.imwrite(str(local_path), _frame_snap)
+                    if not ok:
+                        logger.warning(f"[{camera_id}] Failed to write processed frame to {local_path}")
+                except Exception as e:
+                    logger.warning(f"[{camera_id}] Local frame save failed: {e}")
+
                 # ─ Extract metadata (sync, cheap) ────────────────────────────────
                 md_extra = {"frame_index": frame_count}
                 if detection:
@@ -606,7 +631,7 @@ async def capture_worker(camera_id: str):
                     extractors[camera_id].last_embed_ts = now
 
                 # Fire and forget storage task to keep capture loop moving at 15 FPS
-                async def _task_wrapper(_f=_frame_snap, _ts=ts, _tss=ts_str, _fc=frame_count, _cid=chroma_id, _md=md, _det=detection, _pk=pk_val, _lo=loc, _de=do_embed):
+                async def _task_wrapper(_f=_frame_snap, _ts=ts, _tss=ts_str, _fc=frame_count, _cid=chroma_id, _md=md, _det=detection, _pk=pk_val, _lo=loc, _de=do_embed, _local_path=local_path):
                     try:
                         # ─ 1. Encode JPEG in-process (CPU-bound, fast) ────────────────────────
                         try:
@@ -620,11 +645,10 @@ async def capture_worker(camera_id: str):
                             jpg_bytes = None
 
                         if not jpg_bytes or not _cloudinary_enabled():
-                            return
-
-                        # ─ 2. Fire all 3 cloud ops ──────────────────────────────────────
-                        # Op-A: Cloudinary upload
-                        cdn_url = await loop.run_in_executor(_IO_POOL, _cloudinary_upload_bytes, jpg_bytes, f"surveilx/{camera_id}/{_cid.replace(':', '_')}")
+                            cdn_url = None
+                        else:
+                            # ─ 2. Fire cloud upload ───────────────────────────────────────
+                            cdn_url = await loop.run_in_executor(_IO_POOL, _cloudinary_upload_bytes, jpg_bytes, f"surveilx/{camera_id}/{_cid.replace(':', '_')}")
                         
                         # Op-B: DB insert
                         def _op_db():
@@ -637,7 +661,7 @@ async def capture_worker(camera_id: str):
                                 resolution=_md.get("resolution"),
                                 metadata_json={
                                     **(_md.get("metadata_json") or {}),
-                                    "file_path": "",
+                                    "file_path": str(local_path) if local_path else "",
                                     "frame_index": _fc,
                                     **( {"cloudinary_url": cdn_url} if cdn_url else {} ),
                                 },

@@ -6,26 +6,30 @@ from chromadb.config import Settings as ChromaSettings
 
 logger = logging.getLogger(__name__)
 
-CHROMA_HOST = os.getenv("CHROMA_HOST", "chroma.railway.internal").strip()
+CHROMA_HOST = os.getenv("CHROMA_HOST", "").strip()
 CHROMA_PORT = os.getenv("CHROMA_PORT", "8000").strip()
 CHROMA_TOKEN = os.getenv("CHROMA_TOKEN", "2igo7cy4p184i5w7").strip()
 
-# Make sure to include http:// or https://
-if not CHROMA_HOST.startswith("http"):
-    RAILWAY_URL = f"http://{CHROMA_HOST}"
+if CHROMA_HOST:
+    # Make sure to include http:// or https://
+    if not CHROMA_HOST.startswith("http"):
+        RAILWAY_URL = f"http://{CHROMA_HOST}"
+    else:
+        RAILWAY_URL = CHROMA_HOST
+
+    if CHROMA_PORT:
+        RAILWAY_URL = f"{RAILWAY_URL}:{CHROMA_PORT}"
+
+    logger.info(f"Chroma: connecting to remote at {RAILWAY_URL}")
+
+    # Connect to Railway ChromaDB instance
+    client = chromadb.HttpClient(
+        host=RAILWAY_URL,
+        headers={"Authorization": f"Bearer {CHROMA_TOKEN}"} if CHROMA_TOKEN else {}
+    )
 else:
-    RAILWAY_URL = CHROMA_HOST
-
-if CHROMA_PORT:
-    RAILWAY_URL = f"{RAILWAY_URL}:{CHROMA_PORT}"
-
-logger.info(f"Chroma: connecting to remote at {RAILWAY_URL}")
-
-# Connect to Railway ChromaDB instance
-client = chromadb.HttpClient(
-    host=RAILWAY_URL,
-    headers={"Authorization": f"Bearer {CHROMA_TOKEN}"} if CHROMA_TOKEN else {}
-)
+    logger.info("Chroma: No CHROMA_HOST provided. Using local PersistentClient.")
+    client = chromadb.PersistentClient(path="./chroma_db")
 
 COLLECTION_NAME = "video_frames"
 

@@ -18,6 +18,68 @@ let OVERLAY_VISIBLE = localStorage.getItem(OVERLAY_KEY) !== 'false'; // Default 
 let SIDEBAR_FOLDED = localStorage.getItem(SIDEBAR_KEY) === 'true'; // Default FALSE
 const LOGS = []; // Legacy placeholder, UI removed
 
+const SIDEBAR_CONTEXTS = {
+    dashboard: {
+        value: 'Overview',
+        metric1Label: 'Active Cameras',
+        metric1Value: () => `${CAMS.length}/${CAMS.length || 0}`,
+        metric2Label: 'Live Alerts',
+        metric2Value: () => Object.keys(DETECTION_STATE || {}).length,
+    },
+    cameras: {
+        value: 'Camera Registry',
+        metric1Label: 'Online Feeds',
+        metric1Value: () => `${CAMS.filter(c => c.enabled !== false).length}/${CAMS.length || 0}`,
+        metric2Label: 'Add Camera',
+        metric2Value: () => 'Available',
+    },
+    events: {
+        value: 'Alerts Feed',
+        metric1Label: 'Recent Alerts',
+        metric1Value: () => Object.values(DETECTION_STATE || {}).filter(v => v && v.is_alert).length,
+        metric2Label: 'System State',
+        metric2Value: () => 'Monitoring',
+    },
+    analytics: {
+        value: 'Analytics',
+        metric1Label: 'Cameras',
+        metric1Value: () => CAMS.length,
+        metric2Label: 'Insights',
+        metric2Value: () => 'Live',
+    },
+    search: {
+        value: 'Layout',
+        metric1Label: 'Presets',
+        metric1Value: () => '6',
+        metric2Label: 'Mode',
+        metric2Value: () => VIEW_MODE,
+    },
+    settings: {
+        value: 'Settings',
+        metric1Label: 'Role',
+        metric1Value: () => localStorage.getItem(ROLE_KEY) || 'unknown',
+        metric2Label: 'Sync',
+        metric2Value: () => 'Pending',
+    }
+};
+
+function updateSidebarContext(tabId) {
+    const context = SIDEBAR_CONTEXTS[tabId] || SIDEBAR_CONTEXTS.dashboard;
+    const titleEl = document.getElementById('sidebar-context-label');
+    const valueEl = document.getElementById('sidebar-context-value');
+    const metric1LabelEl = document.getElementById('sidebar-metric-1-label');
+    const metric1ValueEl = document.getElementById('sidebar-metric-1-value');
+    const metric2LabelEl = document.getElementById('sidebar-metric-2-label');
+    const metric2ValueEl = document.getElementById('sidebar-metric-2-value');
+
+    if (titleEl) titleEl.textContent = 'Dashboard Context';
+    if (valueEl) valueEl.textContent = context.value;
+    if (metric1LabelEl) metric1LabelEl.textContent = context.metric1Label;
+    if (metric1ValueEl) metric1ValueEl.textContent = String(context.metric1Value());
+    if (metric2LabelEl) metric2LabelEl.textContent = context.metric2Label;
+    if (metric2ValueEl) metric2ValueEl.textContent = String(context.metric2Value());
+}
+
 // --- Alerts ---
 class AlertQueue {
     constructor() {
@@ -389,6 +451,22 @@ function bindGlobalEvents() {
 
     // Keyboard Shortcuts
     document.addEventListener('keydown', handleKeyboardShortcuts);
+    // Allow Escape to exit fullscreen if active
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && document.fullscreenElement) {
+            try { document.exitFullscreen(); } catch (err) { /* ignore */ }
+        }
+    });
+    // When exiting fullscreen, return to grid view to allow minimizing
+    function onFullScreenChange() {
+        if (!document.fullscreenElement) {
+            VIEW_MODE = 'grid';
+            localStorage.setItem('viewMode', VIEW_MODE);
+            applyViewMode();
+        }
+    }
+    document.addEventListener('fullscreenchange', onFullScreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullScreenChange);
 
     // Nav Links
     const navLinks = Array.from(document.querySelectorAll('.nav a'));
@@ -397,6 +475,7 @@ function bindGlobalEvents() {
         a.classList.add('active');
 
         const targetId = a.getAttribute('href').substring(1);
+        updateSidebarContext(targetId);
         const sections = document.querySelectorAll('main section');
         
         // Define which sections belong to which "tab"
@@ -425,9 +504,6 @@ function bindGlobalEvents() {
         if (targetId === 'dashboard') {
             loadCameras();
             fetchAdminOverview();
-        }
-        if (targetId === 'clips') {
-            initClipsPage();
         }
     }));
 
@@ -565,21 +641,23 @@ async function loadCameras() {
 
         camsDiv.innerHTML = '';
         const cams = applySavedOrder(res.cameras || []);
-        CAMS = cams;
+        // Deduplicate by id in case backend returned duplicates
+        const unique = Array.from(new Map(cams.map(c => [String(c.id), c])).values());
+        CAMS = unique;
 
         const countEl = document.getElementById('cam-count');
-        if (countEl) countEl.textContent = `${cams.length} camera(s)`;
+        if (countEl) countEl.textContent = `${unique.length} camera(s)`;
 
-        populateDropdown(cams);
+        populateDropdown(unique);
 
-        cams.forEach(({ id, name }) => {
+        unique.forEach(({ id, name }) => {
             const card = createCameraCard(id, name);
             camsDiv.appendChild(card);
         });
 
         if (camsDiv.scrollTo) camsDiv.scrollTo(0, currentScroll);
 
-        buildThumbbar(cams);
+        buildThumbbar(unique);
         applyFocusFromDropdown();
         applyViewMode();
         renderDetectionTabs();
@@ -601,31 +679,39 @@ function createCameraCard(id, name) {
     card.addEventListener('dragover', (e) => e.preventDefault());
     card.addEventListener('drop', (e) => onDrop(e, id));
 
-    const header = document.createElement('div');
-    header.className = 'cam-header';
-    const title = document.createElement('h3');
-    title.textContent = name ? `${name} (${id})` : `Camera: ${id}`;
-    header.appendChild(title);
-
-    const badge = document.createElement('div');
-    badge.className = 'pill cam-badge';
-    badge.dataset.badgeFor = id;
-    badge.textContent = 'Active';
-    header.appendChild(badge);
-
-    const confBadge = document.createElement('div');
-    confBadge.className = 'pill cam-conf hidden';
-    confBadge.style.fontSize = '0.75rem';
-    confBadge.style.marginLeft = 'auto'; // Push to right
-    header.appendChild(confBadge);
-
     const frame = document.createElement('div');
     frame.className = 'frame';
+
+    // Badges inside video frame
+    const badgesOverlay = document.createElement('div');
+    badgesOverlay.className = 'cam-badges-overlay';
+    
+    const badge = document.createElement('div');
+    badge.className = 'pill rec cam-badge';
+    badge.dataset.badgeFor = id;
+    badge.innerHTML = '● REC';
+    badgesOverlay.appendChild(badge);
+
+    const confBadge = document.createElement('div');
+    confBadge.className = 'pill motion cam-conf hidden';
+    confBadge.innerHTML = '● MOTION';
+    badgesOverlay.appendChild(confBadge);
+
+    frame.appendChild(badgesOverlay);
+
+    // Timestamp
+    const timestamp = document.createElement('div');
+    timestamp.className = 'cam-timestamp';
+    const updateTime = () => { timestamp.textContent = new Date().toLocaleTimeString([], { hour12: true }); };
+    updateTime();
+    setInterval(updateTime, 1000);
+    frame.appendChild(timestamp);
 
     // Confidence Overlay Container
     const probs = document.createElement('div');
     probs.className = 'cam-probs hidden';
     frame.appendChild(probs);
+    
     const img = document.createElement('img');
     img.src = `/stream/${id}`;
     img.alt = `Stream ${id}`;
@@ -642,8 +728,34 @@ function createCameraCard(id, name) {
     });
 
     frame.appendChild(img);
-    card.appendChild(header);
+
+    // Info bar below video
+    const infoBar = document.createElement('div');
+    infoBar.className = 'cam-info-bar';
+    
+    const infoLeft = document.createElement('div');
+    infoLeft.className = 'cam-info-left';
+    
+    const title = document.createElement('div');
+    title.className = 'cam-name';
+    title.textContent = name ? name : `Camera ${id}`;
+    
+    const location = document.createElement('div');
+    location.className = 'cam-location';
+    location.textContent = `Location ${id}`; // Placeholder
+    
+    infoLeft.appendChild(title);
+    infoLeft.appendChild(location);
+
+    const infoRight = document.createElement('div');
+    infoRight.className = 'cam-status';
+    infoRight.innerHTML = `<div class="status-dot"></div> Live`;
+
+    infoBar.appendChild(infoLeft);
+    infoBar.appendChild(infoRight);
+
     card.appendChild(frame);
+    card.appendChild(infoBar);
 
     return card;
 }
@@ -777,12 +889,24 @@ function handleKeyboardShortcuts(e) {
 }
 
 function requestFullscreen(elem) {
-    if (elem.requestFullscreen) {
-        elem.requestFullscreen();
-    } else if (elem.webkitRequestFullscreen) { /* Safari */
-        elem.webkitRequestFullscreen();
-    } else if (elem.msRequestFullscreen) { /* IE11 */
-        elem.msRequestFullscreen();
+    // Toggle fullscreen: exit if already fullscreen, otherwise request
+    try {
+        if (document.fullscreenElement) {
+            if (document.exitFullscreen) return document.exitFullscreen();
+            if (document.webkitExitFullscreen) return document.webkitExitFullscreen();
+            if (document.msExitFullscreen) return document.msExitFullscreen();
+            return;
+        }
+
+        if (elem.requestFullscreen) {
+            elem.requestFullscreen();
+        } else if (elem.webkitRequestFullscreen) { /* Safari */
+            elem.webkitRequestFullscreen();
+        } else if (elem.msRequestFullscreen) { /* IE11 */
+            elem.msRequestFullscreen();
+        }
+    } catch (err) {
+        console.warn('Fullscreen toggle failed', err);
     }
 }
 
@@ -846,7 +970,9 @@ function renderSimilarResults(data, minPct) {
     let shown = 0;
     for (const item of items) {
         const pct = typeof item.score === 'number' ? Math.max(0, Math.min(1, item.score)) * 100 : undefined;
-        if (typeof pct === 'number' && minPct && pct < minPct) continue;
+        if (typeof pct === 'number' && minPct && pct < minPct) {
+            continue;
+        }
 
         const div = document.createElement('div');
         div.className = 'similar-item';
@@ -894,8 +1020,47 @@ function renderSimilarResults(data, minPct) {
     }
 
     const card = document.getElementById('similar-card');
-    if (shown === 0)
-        wrap.innerHTML = '<div class="muted" style="padding:10px;">No high-confidence matches found.</div>';
+    if (shown === 0) {
+        if (items.length > 0) {
+            const fallback = items
+                .slice()
+                .sort((a, b) => (b.score || 0) - (a.score || 0))
+                .slice(0, 3);
+
+            wrap.innerHTML = '<div class="muted" style="padding:10px;">No results met the match threshold. Showing the closest visual matches instead.</div>';
+            fallback.forEach((item) => {
+                const div = document.createElement('div');
+                div.className = 'similar-item';
+
+                if (item.cloudinary_url) {
+                    const img = document.createElement('img');
+                    img.src = item.cloudinary_url;
+                    img.alt = item.id;
+                    img.loading = 'lazy';
+                    img.style.cssText = 'width:100%;border-radius:6px;object-fit:cover;max-height:120px;';
+                    div.appendChild(img);
+                }
+
+                const cap = document.createElement('div');
+                cap.className = 'cap';
+                cap.style.marginTop = '6px';
+                const ts = item.timestamp_iso ? formatTimestamp(item.timestamp_iso) : '';
+                const pct = typeof item.score === 'number' ? Math.max(0, Math.min(1, item.score)) * 100 : undefined;
+                const simTxt = typeof pct === 'number' ? `<span style="color:var(--warning);font-size:11px">${pct.toFixed(1)}% match</span>` : '';
+                const lblTxt = item.violence_label && item.violence_label !== 'Normal'
+                    ? `<span class="pill pill-error" style="font-size:10px">${item.violence_label}</span> `
+                    : '';
+                cap.innerHTML = `
+                    <div style="font-weight:600;font-size:12px">${item.camera_id || ''}</div>
+                    <div style="font-size:11px;color:var(--text-muted)">${ts}</div>
+                    <div style="margin-top:3px">${lblTxt}${simTxt}</div>`;
+                div.appendChild(cap);
+                wrap.appendChild(div);
+            });
+        } else {
+            wrap.innerHTML = '<div class="muted" style="padding:10px;">No high-confidence matches found.</div>';
+        }
+    }
     if (card) {
         card.style.display = 'block';
         card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -909,67 +1074,6 @@ function renderSimilarResults(data, minPct) {
 
 // openClipFromFrameModal removed in favor of independent generators
 
-
-// ════════════════════════════════════════════════════════════════════════════
-// Video Clips Page — permanent page UI (not a modal)
-// ════════════════════════════════════════════════════════════════════════════
-
-let _clipsPageInitialized = false;
-
-function initClipsPage() {
-    if (_clipsPageInitialized) return;
-    _clipsPageInitialized = true;
-
-    const sel = document.getElementById('clip-page-cam');
-    if (sel && sel.options.length === 0) {
-        sel.innerHTML = CAMS.map(c => `<option value="${c.id}">${c.name || 'Cam ' + c.id}</option>`).join('');
-    }
-
-    const customBtn = document.getElementById('clip-page-custom-btn');
-    if (customBtn) {
-        customBtn.onclick = function() {
-            const camId    = document.getElementById('clip-page-cam')?.value;
-            const startVal = document.getElementById('clip-page-start')?.value;
-            const endVal   = document.getElementById('clip-page-end')?.value;
-
-            if (!camId || !startVal || !endVal) { 
-                showToast('Please select camera and time range', 'warn'); 
-                return; 
-            }
-
-            const startTs = new Date(startVal);
-            const endTs   = new Date(endVal);
-            if (endTs <= startTs) { 
-                showToast('End time must be after start time', 'warn'); 
-                return; 
-            }
-
-            const spanSec = Math.round((endTs - startTs) / 1000);
-            const url = `/api/video/clip?camera_id=${encodeURIComponent(camId)}&timestamp=${encodeURIComponent(startTs.toISOString())}&before=0&after=${spanSec}`;
-
-            runAsyncAction(this, async () => {
-                const res = await fetch(url, { headers: { 'Authorization': `Bearer ${localStorage.getItem('authToken')}` } });
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({}));
-                    throw new Error(err.detail || 'Clip generation failed');
-                }
-                const data = await res.json();
-                if (data.url) {
-                    const area = document.getElementById('clip-page-result');
-                    const vid  = document.getElementById('clip-page-video');
-                    const dl   = document.getElementById('clip-page-dl');
-                    if (vid) {
-                        vid.src = data.url;
-                        if (dl) dl.href = data.url;
-                        if (area) area.style.display = 'block';
-                        vid.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        vid.play().catch(() => {});
-                    }
-                }
-            }, 'Building clip...');
-        };
-    }
-}
 
 // Timezone Helper
 let APP_TIMEZONE = 'UTC+0';
@@ -1171,13 +1275,20 @@ async function loadAdminUsers() {
         const data = await fetchJSON('/admin/users');
         const tbody = document.getElementById('admin-users-tbody');
         if (!tbody) return;
+        const users = data.users || [];
+        const totalEl = document.getElementById('admin-users-total');
+        const adminsEl = document.getElementById('admin-users-admins');
+        const activeEl = document.getElementById('admin-users-active');
+        if (totalEl) totalEl.textContent = String(users.length);
+        if (adminsEl) adminsEl.textContent = String(users.filter(u => String(u.role).toLowerCase() === 'admin').length);
+        if (activeEl) activeEl.textContent = String(users.filter(u => !u.disabled).length);
         tbody.innerHTML = '';
-        (data.users || []).forEach(u => {
+        users.forEach(u => {
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td><div class="user-row"><span class="u-name">${u.username}</span></div></td>
                 <td><span class="pill ${u.role === 'admin' ? 'pill-admin' : 'pill-user'}">${u.role}</span></td>
-                <td><span class="status-dot ${u.disabled ? 'status-offline' : 'status-online'}"></span> ${u.disabled ? 'Disabled' : 'Active'}</td>
+                <td><span class="status-chip"><span class="status-dot ${u.disabled ? 'status-offline' : 'status-online'}"></span>${u.disabled ? 'Disabled' : 'Active'}</span></td>
                 <td>
                     <div class="actions">
                         <button class="btn btn-sm" data-act="reset" title="Reset PW">🔑</button>
@@ -1296,12 +1407,14 @@ async function loadAdminCameras() {
         if (!grid) return;
 
         // ── Capacity banner ──────────────────────────────────────────────
-        const bannerColor = limits.at_limit ? 'var(--error)'
-            : limits.slots_remaining <= 1  ? 'var(--warn, #f59e0b)'
-            : 'var(--success)';
         const bannerMsg = limits.at_limit
             ? `⚠️ Camera limit reached (${limits.current_cameras}/${limits.max_cameras}) — remove a camera to add a new one`
             : `📹 ${limits.current_cameras} / ${limits.max_cameras} cameras in use · ${limits.slots_remaining} slot${limits.slots_remaining === 1 ? '' : 's'} remaining`;
+        const bannerElClass = limits.at_limit
+            ? 'capacity-banner error'
+            : limits.slots_remaining <= 1
+              ? 'capacity-banner warn'
+              : 'capacity-banner';
 
         // Disable/enable the Add Camera button
         const addBtn = document.getElementById('btn-add-camera');
@@ -1313,17 +1426,19 @@ async function loadAdminCameras() {
             addBtn.style.opacity = limits.at_limit ? '0.45' : '';
         }
 
-        grid.innerHTML = `
-            <div style="
-                display:flex; align-items:center; gap:10px;
-                background: color-mix(in srgb, ${bannerColor} 12%, transparent);
-                border: 1px solid ${bannerColor};
-                border-radius: 8px; padding: 10px 14px;
-                margin-bottom: 14px; font-size: 13px; font-weight: 500;
-                color: ${bannerColor}; grid-column: 1 / -1;
-            ">
-                ${bannerMsg}
-            </div>`;
+        const usedEl = document.getElementById('admin-cameras-used');
+        const remainingEl = document.getElementById('admin-cameras-remaining');
+        const limitEl = document.getElementById('admin-cameras-limit');
+        const banner = document.getElementById('admin-cam-banner');
+        if (usedEl) usedEl.textContent = String(limits.current_cameras);
+        if (remainingEl) remainingEl.textContent = String(limits.slots_remaining);
+        if (limitEl) limitEl.textContent = String(limits.max_cameras);
+        if (banner) {
+            banner.className = bannerElClass;
+            banner.textContent = bannerMsg;
+        }
+
+        grid.innerHTML = '';
 
         (data.cameras || []).forEach(c => {
             const d = document.createElement('div');
@@ -1331,11 +1446,12 @@ async function loadAdminCameras() {
             d.innerHTML = `
                 <div class="card-header">
                     <h4>${c.name || 'Cam ' + c.id}</h4>
-                    <span class="pill">${c.enabled ? 'On' : 'Off'}</span>
+                    <span class="pill ${c.enabled ? 'pill-user' : 'pill-admin'}">${c.enabled ? 'Online' : 'Offline'}</span>
                 </div>
                 <div class="card-body">
                     <p><strong>ID:</strong> ${c.id}</p>
                     <p><strong>Zone:</strong> ${c.zone || 'None'}</p>
+                    <p><strong>Source:</strong> ${c.source_url || 'Not set'}</p>
                 </div>
                 <div class="card-actions">
                     <button class="btn btn-sm" data-act="edit">Edit</button>
@@ -1433,19 +1549,19 @@ function openCameraModal({ title, init = {}, onSubmit }) {
              </div>
              <div class="form-group">
                 <label>Select Video File</label>
-                <div style="display:flex; gap:10px; align-items:center;">
-                    <label class="btn secondary" style="cursor:pointer;">
+                <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                    <label class="btn secondary" style="cursor:pointer; min-width:112px;">
                         Choose File
                         <input id="cam-file-picker" type="file" accept="video/*" style="display:none;">
                     </label>
-                    <div id="cam-file-status" class="muted" style="font-size:0.9em;">
+                    <div id="cam-file-status" class="muted" style="font-size:0.9em; padding-top:2px;">
                         ${initialTab === 'file' ? '✅ current file set' : 'No file selected'}
                     </div>
                 </div>
              </div>
         </div>
 
-        <div class="form-row">
+        <div class="form-row" style="margin-top: 2px;">
             <div class="form-group">
                 <label>Zone</label>
                 <input id="cam-zone" class="input" value="${zone || ''}">
